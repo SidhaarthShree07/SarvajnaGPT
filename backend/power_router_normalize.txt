@@ -1,0 +1,65 @@
+def _normalize_params(action_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Map parameter aliases to expected names per action type."""
+    p = dict(params or {})
+    at = action_type
+    if at == "word.create_document":
+        # target_rel aliases
+        if "target" in p and "target_rel" not in p:
+            p["target_rel"] = p.pop("target")
+        if "path" in p and "target_rel" not in p:
+            p["target_rel"] = p.pop("path")
+        # paragraph/content aliases
+        if "content" in p and "paragraph" not in p:
+            p["paragraph"] = p.pop("content")
+    elif at == "word.open_and_type":
+        # accept aliases
+        if "content" in p and "text" not in p:
+            p["text"] = p.pop("content")
+        if "target_rel" in p and "save_target" not in p:
+            p["save_target"] = p.pop("target_rel")
+        if "path" in p and "save_target" not in p:
+            p["save_target"] = p.pop("path")
+        if "filepath" in p and "save_target" not in p:
+            p["save_target"] = p.pop("filepath")
+        
+        # Handle location specifications in text like "save to desktop", "save to documents folder"
+        if "text" in p and isinstance(p["text"], str) and not p.get("save_target"):
+            text = p["text"].lower()
+            # Check for location specifications in the text
+            location_matches = re.findall(r'save (?:to|in|on) (desktop|documents?|downloads?|my documents?|my desktop|my downloads?)(?:\s+folder)?', text)
+            if location_matches:
+                # Use the first found location
+                location = location_matches[0]
+                if location in ['desktop', 'my desktop']:
+                    p["save_target"] = "desktop"
+                elif location in ['documents', 'document', 'my documents', 'my document']:
+                    p["save_target"] = "documents"
+                elif location in ['downloads', 'download', 'my downloads', 'my download']:
+                    p["save_target"] = "downloads"
+        
+        # visibility aliases
+        if "showwindow" in p and "show_window" not in p:
+            p["show_window"] = p.pop("showwindow")
+        if "showWindow" in p and "show_window" not in p:
+            p["show_window"] = p.pop("showWindow")
+        if "visible" in p and "show_window" not in p:
+            p["show_window"] = p.pop("visible")
+        
+        # Always ensure CUA and split-screen related parameters are set with defaults
+        p["show_window"] = p.get("show_window", True)
+        p["split_screen"] = p.get("split_screen", True)
+        p["use_os_snap_keys"] = p.get("use_os_snap_keys", True)
+        p["use_cua_for_selection"] = p.get("use_cua_for_selection", True)
+        p["arrangement_delay_ms"] = p.get("arrangement_delay_ms", 800)
+        p["word_side"] = p.get("word_side", "right")
+    elif at == "fs.write_file":
+        if "path" in p and "relative_path" not in p:
+            p["relative_path"] = p.pop("path")
+        if "text" in p and "content" not in p:
+            p["content"] = p.pop("text")
+        if "encoding" not in p:
+            p["encoding"] = "utf-8"
+    elif at == "fs.create_folder":
+        if "parent" in p and "parent_path" not in p:
+            p["parent_path"] = p.pop("parent")
+    return p

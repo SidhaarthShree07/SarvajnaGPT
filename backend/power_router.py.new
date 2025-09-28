@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+from typing import List, Optional, Dict, Any
+import os
+import shutil
+import pathlib
+from pathlib import Path
+import uuid
+import re
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from llm_inference import generate_response
+
+# Reuse fs and word executors by delegating to existing routers/adapters
+from agent_router import ActionType as FsActionType, Action as FsAction, preview as fs_preview, execute as fs_execute
+from word_router import preview as word_preview, execute as word_execute
+from automation_router import word_preview as auto_word_preview, word_execute as auto_word_execute
+import sqlite3, time
+
+DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), 'chat_embeddings.db'))
+
+def _chat_state_upsert(chat_id: str, service: str | None, tags: list[str] | None, doc_path: str | None):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Ensure table exists (defensive)
+        c.execute('''CREATE TABLE IF NOT EXISTS chat_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT,
+            service TEXT,
+            persistent_tags TEXT,
+            doc_path TEXT,
+            created_at INTEGER,
+            updated_at INTEGER
+        )''')
+        now = int(time.time())
+        # Find existing
+        if service:
+            c.execute('SELECT id, persistent_tags, doc_path FROM chat_state WHERE chat_id=? AND service=? ORDER BY id DESC LIMIT 1', (chat_id, service))
+        else:
+            c.execute('SELECT id, persistent_tags, doc_path FROM chat_state WHERE chat_id=? ORDER BY id DESC LIMIT 1', (chat_id,))
+        row = c.fetchone()
+        tags_str = None
+        if tags:
+            tags_norm = [str(t).strip() for t in tags if t and str(t).strip()]
+            if tags_norm:
+                tags_str = ','.join(tags_norm)
+        if row:
+            rid, prev_tags, prev_doc = row
+            new_tags = tags_str if tags_str is not None else prev_tags
+            new_doc = doc_path if doc_path is not None else prev_doc
+            c.execute('UPDATE chat_state SET persistent_tags=?, doc_path=?, updated_at=? WHERE id=?', (new_tags, new_doc, now, rid))
+        else:
+            c.execute('INSERT INTO chat_state (chat_id, service, persistent_tags, doc_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', (chat_id, service, tags_str, doc_path, now, now))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def _chat_state_get(chat_id: str, service: str | None):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        if service:
+            c.execute('SELECT persistent_tags, doc_path FROM chat_state WHERE chat_id=? AND service=? ORDER BY id DESC LIMIT 1', (chat_id, service))
+        else:
+            c.execute('SELECT persistent_tags, doc_path FROM chat_state WHERE chat_id=? ORDER BY id DESC LIMIT 1', (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return None
+        ptags, dpath = row
+        tags = []
+        if ptags:
+            try:
+                tags = [t.strip() for t in str(ptags).split(',') if t and str(t).strip()]
+            except Exception:
+                tags = []
+        return {"persistent_tags": tags, "doc_path": dpath}
+    except Exception:
+        return None
+
+
+# New functions for user path resolution
+def _get_standard_user_folder(folder_name: str) -> Path:
+    """Get standard user folders like Documents, Desktop, Downloads."""
+    try:
+        if os.name == 'nt':  # Windows
+            home = Path.home()
+            if folder_name.lower() in ['documents', 'document', 'docs', 'doc']:
+                return home / 'Documents'
+            elif folder_name.lower() in ['desktop', 'desk']:
+                return home / 'Desktop'
+            elif folder_name.lower() in ['downloads', 'download', 'down']:
+                return home / 'Downloads'
+            else:
+                # Default to Documents
+                return home / 'Documents'
+        else:  # Unix-like
+            home = Path.home()
+            if folder_name.lower() in ['documents', 'document', 'docs', 'doc']:
+                return home / 'Documents'
+            elif folder_name.lower() in ['desktop', 'desk']:
+                return home / 'Desktop'
+            elif folder_name.lower() in ['downloads', 'download', 'down']:
+                return home / 'Downloads'
+            else:
+                # Default to Documents
+                return home / 'Documents'
+    except Exception:
+        # Fall back to agent base directory if something goes wrong
+        return Path(AGENT_BASE_DIR)
+
+
+def _resolve_save_path(save_target: str, chat_id: Optional[str] = None) -> str:
+    """
+    Resolves the save path for Word documents based on user input.
+    Handles:
+    1. Absolute paths
+    2. Standard user folders (Desktop, Documents, Downloads)
+    3. Relative paths under the agent output directory
+    
+    Also ensures unique filenames when needed.
+    """
+    # If it's an absolute path, validate and return it
+    if os.path.isabs(save_target):
+        return save_target
+    
+    # Check if it starts with a standard user folder name
+    folder_match = re.match(r'^(desktop|documents?|downloads?)[/\\](.+)$', save_target, re.IGNORECASE)
+    if folder_match:
+        folder_name = folder_match.group(1)
+        file_path = folder_match.group(2)
+        base_folder = _get_standard_user_folder(folder_name)
+        
+        # Create SarvajnaGPT folder if it doesn't exist
+        target_folder = base_folder / 'SarvajnaGPT'
+        target_folder.mkdir(exist_ok=True)
+        
+        # Ensure filename is unique
+        if '.' not in file_path:
+            file_path = f"{file_path}.docx"
+        
+        path = target_folder / file_path
+        if path.exists():
+            # Add unique suffix if file exists
+            stem = path.stem
+            suffix = path.suffix
+            unique_id = uuid.uuid4().hex[:8]
+            path = target_folder / f"{stem}_{unique_id}{suffix}"
+        
+        return str(path)
+    
+    # Check if it's just a folder name like "desktop" or "documents"
+    if save_target.lower() in ['desktop', 'documents', 'downloads', 'document', 'download', 'docs', 'doc', 'desk', 'down']:
+        base_folder = _get_standard_user_folder(save_target)
+        
+        # Create SarvajnaGPT folder if it doesn't exist
+        target_folder = base_folder / 'SarvajnaGPT'
+        target_folder.mkdir(exist_ok=True)
+        
+        # Generate a filename using chat_id or a timestamp
+        filename = f"{chat_id if chat_id else 'document'}_{uuid.uuid4().hex[:8]}.docx"
+        return str(target_folder / filename)
+    
+    # Default behavior: save under agent_output directory
+    try:
+        return _resolve_under_base(save_target)
+    except ValueError:
+        # If the target path is outside the agent base directory, save to Documents/SarvajnaGPT
+        base_folder = _get_standard_user_folder('documents')
+        target_folder = base_folder / 'SarvajnaGPT'
+        target_folder.mkdir(exist_ok=True)
+        
+        # Extract just the filename from the path
+        filename = os.path.basename(save_target)
+        if not filename or '.' not in filename:
+            # Generate a filename if none is provided or it doesn't have an extension
+            filename = f"{chat_id if chat_id else 'document'}_{uuid.uuid4().hex[:8]}.docx"
+        
+        return str(target_folder / filename)
+
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+AGENT_BASE_DIR = os.path.join(REPO_ROOT, "agent_output")
+os.makedirs(AGENT_BASE_DIR, exist_ok=True)
+
+
+def _resolve_under_base(path_like: str) -> str:
+    p = path_like
+    if not os.path.isabs(p):
+        p = os.path.join(AGENT_BASE_DIR, p)
+    p = os.path.abspath(p)
+    base = os.path.abspath(AGENT_BASE_DIR)
+    if os.path.commonpath([p, base]) != base:
+        raise ValueError("Target path outside agent base directory")
+    return p
+
+
+router = APIRouter(prefix="/api", tags=["power"])
+
+
+class PowerChatRequest(BaseModel):
+    chat_id: str
+    text: str
+    # Optional context fields from the UI (ignored by older clients)
+    mem_context: Optional[str] = None
+    doc_info: Optional[str] = None
+    selected_tags: Optional[list[str]] = None
+    mem_tags: Optional[list[str]] = None
+    auto_execute: bool = True
+    service: Optional[str] = None
+
+
+class ProposedAction(BaseModel):
+    type: str
+    params: Dict[str, Any]
