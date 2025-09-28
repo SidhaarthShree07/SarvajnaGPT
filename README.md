@@ -63,6 +63,40 @@ Planned mobile enhancements (roadmap): in-chat audio recording button, simplifie
    - Memory/embeddings: research-first retrieval (SQLite + embeddings) with folder-first tag resolution
    - Automation: `run.py` auto-clones https://github.com/trycua/cua into `backend/cua`
 
+   ### CUA "Power Mode" Automation Layer
+
+   SarvajñaGPT integrates the open-source **CUA (Computer Use Automation)** stack to provide a higher-level "power mode" for desktop actions. This lets the agent move beyond plain text responses and actually arrange and focus application windows on Windows (currently primary focus):
+
+   - VS Code automation
+      - Open or reuse an existing VS Code window for a target file (no duplicate instance spam)
+      - Force split-screen with the current foreground window (left or right side) using Snap Assist heuristics
+      - Prefer CUA-driven Snap selection when the CUA agent is healthy; gracefully fall back to native Win+Arrow snapping
+   - Word automation (COM)
+      - Create new or open existing .docx files, insert/append text, optionally save to a sandbox path
+      - Optional auto-split with the initiating window for side-by-side editing
+   - Adaptive snapping strategy
+      - Primary: CUA enumerates and selects Snap layout tiles programmatically (fewer keystroke heuristics)
+      - Fallback: deterministic Win + Arrow key sequences to achieve target half-side when CUA is unavailable
+   - State awareness & idempotence
+      - Internal split-state tracker avoids re-snapping if layout already matches (prevents flicker and race conditions)
+      - Reuses window handles where practical instead of spawning new processes
+   - Resilient planning integration
+      - High-level plan steps in `power_router.py` delegate to `automation_router.py` endpoints (`/api/automation/...`) instead of duplicating logic
+      - Planner-sent `split_screen=false` on first open is normalized to true to preserve consistent UX (user intent: always see code next to chat)
+   - Safety & diagnostics
+      - Rich runtime status endpoint for CUA availability and last diagnostics
+      - Graceful degradation path ensures a failed CUA attempt still opens the target file/window via simpler fallback
+
+   Key Files:
+   ```text
+   backend/automation_router.py   # VS Code + Word endpoints, snapping logic, CUA integration
+   backend/power_router.py        # High-level action orchestration delegating to automation
+   backend/cua_adapter.py         # Light wrapper/status bridge to bundled CUA repo
+   backend/cua/                   # Cloned upstream CUA project (auto via run.py)
+   ```
+
+   Result: When the agent "opens a file in VS Code" or "types into Word and split-screens", the action is reliable, reuses windows, and adapts to environment capabilities without exposing low-level complexity to the user.
+
 ## Installation
 
 You can run SarvajñaGPT in two modes: Quick Dev (auto spawns two terminals) or Manual (production‑style single backend serving built frontend).
