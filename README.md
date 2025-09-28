@@ -65,42 +65,55 @@ Planned mobile enhancements (roadmap): in-chat audio recording button, simplifie
 
 ## Installation
 
-Quick start (Windows):
+You can run SarvajñaGPT in two modes: Quick Dev (auto spawns two terminals) or Manual (production‑style single backend serving built frontend).
+
+### 1. Quick Dev (Windows)
 
 ```powershell
 python run.py
 ```
 
-This will:
-- Create a venv in `backend/.venv`
-- Install backend requirements
-- Auto-clone the CUA repo to `backend/cua` (no manual folder creation)
-- Launch backend (uvicorn) and frontend (Vite) in two terminals
+What this does:
+1. Creates a virtual environment at `backend/.venv`.
+2. Installs Python dependencies from `backend/requirements.txt` (canonical list; root requirements file was removed).
+3. Clones the CUA repo into `backend/cua` if missing.
+4. Starts FastAPI (uvicorn with `--reload`) and Vite dev server (hot module reload) in separate PowerShell windows.
 
-Requirements: Git, Python 3.11+, Node.js 18+.
+Access the app (dev): http://localhost:5173 (or the alternative port Vite shows if 5173 is busy).
 
-For manual setup or extra details, see INSTALLATION_GUIDE.md.
+### 2. Manual / Production‑Style
 
-### Manual backend start
+Build the frontend once, then let the backend serve the static bundle on port 8000.
 
-If you prefer to launch the backend manually instead of using `run.py`:
+```powershell
+# From project root
+cd frontend; npm install; npm run build
+cd ..\backend; python -m venv .venv; . .\.venv\Scripts\Activate.ps1; pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Access the app at: http://192.168.29.53:8000 (use your machine's LAN IP if different)
+
+Notes:
+- The backend auto-detects `../frontend/dist` and serves it at `/` if present.
+- `--reload` is for development; remove it for a quieter production process.
+- All Python deps live in `backend/requirements.txt` (root file intentionally removed).
+
+### 3. Minimal Manual Backend (no build yet)
+
+If you only want the API first:
 
 ```powershell
 cd backend; uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Why this form?
-- `cd backend` lets uvicorn import `main:app` without the `backend.` prefix.
-- `--host 0.0.0.0` exposes the API to your LAN (so you can hit it from another device). Use `127.0.0.1` if you want to restrict to local machine.
-- `--reload` is convenient during development (hot-reloads). Omit it for production.
+Later you can build the frontend and refresh the page at http://192.168.29.53:8000 to get the UI.
 
-After starting, open another terminal for the frontend:
+### Requirements
 
-```powershell
-cd frontend; npm install; npm run dev
-```
+Git, Python 3.11+, Node.js 18+, (optional) Ollama running locally for models.
 
-Then visit the shown Vite dev URL (usually http://localhost:5173 or http://<LAN-IP>:5173).
+For deeper troubleshooting steps see `INSTALLATION_GUIDE.md`.
 
 ## Model Management (Ollama)
 
@@ -130,21 +143,18 @@ Notes
 - Clean outputs
    - Chat markdown is sanitized and styled for readability, preserving emphasis and code formatting
 
-## Project Structure
+## Project Structure (simplified)
 
 ```
 SarvajñaGPT/
-├─ backend/
-│  ├─ main.py               # FastAPI app and endpoints (chat, memory, models)
-│  ├─ llm_inference.py      # Ollama inference + model persistence
-│  └─ ...
-├─ frontend/
-│  ├─ src/
-│  │  ├─ App.vue            # App shell: agents, model modals, carousel
-│  │  └─ components/        # ResearchAssistant, MemoryManager, etc.
-│  └─ ...
-├─ requirements.txt         # Root Python deps
-└─ backend/requirements.txt # Backend-specific deps
+├─ backend/                 # FastAPI app, automation, embeddings
+│  ├─ main.py               # Core API + static mount of built frontend
+│  ├─ llm_inference.py      # Model selection + Ollama bridge
+│  └─ requirements.txt      # Canonical Python dependency list
+├─ frontend/                # Vue 3 + Vite source
+│  ├─ src/                  # Components & views
+│  └─ dist/                 # Built assets (created by npm run build)
+└─ run.py                   # Dev convenience launcher (spawns both servers)
 ```
 
 ## Troubleshooting
@@ -152,7 +162,7 @@ SarvajñaGPT/
 - Frontend doesn’t start (port busy)
    - Vite uses 5173 by default; if busy, it will prompt to use another port. Accept the prompt and reload the page.
 - Backend not reachable
-   - Confirm `uvicorn` is running on 127.0.0.1:8000 and not blocked by a firewall
+   - Confirm `uvicorn` is running on http://192.168.29.53:8000 (or your LAN IP) and not blocked by a firewall
 - “No models found” in the modal
    - Ensure the Ollama app/service is running locally
    - Try refreshing the list from the modal
