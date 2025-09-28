@@ -52,7 +52,10 @@ import logging
 import re, threading, time, unicodedata, asyncio, uuid
 import soundfile as sf
 import numpy as np
-from TTS.api import TTS
+try:
+    from TTS.api import TTS  # Provided by the coqui-tts package
+except Exception:
+    TTS = None  # type: ignore
 # Configure root logger so your log messages show up in uvicorn console
 logging.basicConfig(
     level=logging.DEBUG,   # or INFO
