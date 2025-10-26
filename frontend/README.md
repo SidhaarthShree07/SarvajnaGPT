@@ -28,6 +28,16 @@ npm run dev
 npm run build
 ```
 
+After building, the backend (FastAPI) will serve the static files from `frontend/dist` at its root path.
+
+If the backend is running:
+
+```powershell
+cd backend; uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Open app (served by backend) at: http://192.168.29.53:8000
+
 ### Lint with [ESLint](https://eslint.org/)
 
 ```sh

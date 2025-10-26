@@ -20,42 +20,43 @@ This guide covers installing and running SarvajñaGPT on Windows using PowerShel
 
 ## 2) Quick start (recommended)
 
-From the project root, run the helper script:
+From the project root, run:
 
 ```powershell
 python run.py
 ```
 
-What it does:
-- Creates a virtual environment at `backend/.venv`
-- Installs backend requirements
-- Clones the CUA repo into `backend/cua` (requires Git in PATH)
-- Launches backend (uvicorn) and frontend (Vite) in two terminals
+It will:
+1. Create `backend/.venv`
+2. Install Python deps from `backend/requirements.txt` (canonical list)
+3. Clone CUA into `backend/cua` if missing
+4. Launch uvicorn (FastAPI) + Vite dev server in separate PowerShell windows
 
-If you prefer manual setup, continue below.
+Access (dev UI): typically http://localhost:5173  (shows on terminal)  
+API base (dev): http://192.168.29.53:8000
 
 ## 3) Backend dependencies (Python)
 
-From the project root:
+Canonical dependency file is `backend/requirements.txt`. (Root requirements.txt was removed.)
 
 ```powershell
-python -m pip install --upgrade pip ; pip install -r requirements.txt ; pip install -r backend/requirements.txt
+python -m pip install --upgrade pip ; pip install -r backend/requirements.txt
 ```
 
 ## 4) Start the backend
 
-Run uvicorn from inside the `backend` folder and bind to all interfaces (so other devices on your LAN can access it):
+Launch uvicorn from inside `backend` and bind to all interfaces if you want LAN access:
 
 ```powershell
 cd backend; uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+Access:
+- LAN Access: http://192.168.29.53:8000 (replace with your machine's LAN IP if different)
+
 Notes:
-- API base (local machine): http://127.0.0.1:8000
-- API base (LAN devices): http://<your-LAN-IP>:8000  (e.g. `http://192.168.29.53:8000`)
-- `--reload` auto-restarts on code changes (development only)
-- Binding to `0.0.0.0` can trigger a Windows Firewall prompt the first time—allow on Private network if you intend LAN access.
-- Keep this terminal running.
+- `--reload` is for development (auto restart). Remove for production.
+- First bind to 0.0.0.0 may prompt Windows Firewall—allow Private if you need LAN.
 
 ## 5) Frontend dependencies (Node)
 
@@ -65,13 +66,21 @@ Open a new PowerShell window:
 cd frontend ; npm install
 ```
 
-## 6) Run the frontend (Vite)
+## 6) Run or build the frontend
+
+Dev (hot reload):
 
 ```powershell
 npm run dev
 ```
 
-- Dev server: http://192.168.29.53:5173 (port may vary if busy)
+Production build (served by backend when you hit :8000):
+
+```powershell
+npm run build
+```
+
+After build, restart (or start) the backend and open http://192.168.29.53:8000 — the static bundle is mounted automatically if `frontend/dist` exists.
 
 ## 7) Model management (Ollama)
 
