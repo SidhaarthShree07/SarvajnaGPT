@@ -1,18 +1,4 @@
-"""CUA-only Power Router (pure)
-
-This router provides a minimal shape-compatible subset of the existing power router
-implemented only with the CUA adapter. It aims to:
-- Provide a direct "open document" endpoint compatible with the caller but without
-  any Win32/COM/UIAutomation logic.
-- Optionally trigger CUA Snap Assist tile selection for Word or general windows.
-
-Important limitations:
-- No VS Code or filesystem orchestration here; this is purely a sketch of CUA-only
-  behavior for opening documents and hinting a snap tile selection.
-- It relies entirely on `os.startfile` and the CUA adapter’s token selection.
-"""
 from __future__ import annotations
-
 from typing import Any, Dict, Optional
 from pathlib import Path
 from fastapi import APIRouter, HTTPException

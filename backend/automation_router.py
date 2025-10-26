@@ -1,20 +1,4 @@
-"""CUA-only Automation Router (pure)
-
-This module provides a minimal set of automation endpoints implemented purely
-via the CUA adapter, with no Win32, COM, or UIAutomation dependencies.
-
-Scope and design:
-- Keep familiar endpoint shapes where reasonable (/cua/status, /word/execute,
-  /word/open_existing, /shim/info).
-- Avoid window enumeration, OS hotkeys, or COM automation.
-- Best-effort actions only; relies on the user (or caller) to have Word open
-  and focused, or for the environment to present Snap Assist tiles.
-
-Note: If you later replace your existing automation router with this one,
-functionality will be limited to what `cua_adapter` exposes.
-"""
 from __future__ import annotations
-
 from pathlib import Path
 from typing import Any, Dict, Optional
 

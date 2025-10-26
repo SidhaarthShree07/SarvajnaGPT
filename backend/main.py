@@ -10,7 +10,6 @@ except Exception:
     convert_from_path = None
 # Optional PDF renderer that doesn't require Poppler (great for Windows)
 import pypdfium2 as pdfium
-
 try:
     import fitz  # PyMuPDF
 except Exception:
@@ -61,7 +60,6 @@ logging.basicConfig(
     level=logging.DEBUG,   # or INFO
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
 # Suppress noisy UIAutomation element release spam that floods console
 class _SuppressUIAReleaseFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
