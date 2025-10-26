@@ -21,6 +21,8 @@ def _load_model_from_disk(default_model: str) -> str:
 
 MODEL_NAME = _load_model_from_disk("qwen3:8b")
 
+_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "30"))
+
 _settings = {"temperature": 0.7, "max_tokens": 2048}
 
 
@@ -35,14 +37,41 @@ def _query_ollama(prompt: str) -> str:
         "stream": False,  # we want a blocking full response
     }
 
-    response = requests.post(OLLAMA_URL, json=payload)
-    response.raise_for_status()
-    data = response.json()
-    return data.get("response", "").strip()
+    try:
+        response = requests.post(OLLAMA_URL, json=payload, timeout=_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("response", "").strip()
+    except requests.Timeout:
+        return ""
+
+
+def _query_ollama_with_options(prompt: str, *, temperature: float | None = None, max_tokens: int | None = None, model: str | None = None) -> str:
+    """Query Ollama with per-call overrides without mutating global settings."""
+    payload = {
+        "model": model or MODEL_NAME,
+        "prompt": prompt,
+        "options": {
+            "temperature": _settings["temperature"] if temperature is None else temperature,
+            "num_predict": _settings["max_tokens"] if max_tokens is None else max_tokens,
+        },
+        "stream": False,
+    }
+    try:
+        response = requests.post(OLLAMA_URL, json=payload, timeout=_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("response", "").strip()
+    except requests.Timeout:
+        return ""
 
 
 def generate_response(prompt: str) -> str:
     return _query_ollama(prompt)
+
+
+def generate_response_with_options(prompt: str, *, temperature: float | None = None, max_tokens: int | None = None, model: str | None = None) -> str:
+    return _query_ollama_with_options(prompt, temperature=temperature, max_tokens=max_tokens, model=model)
 
 
 def summarize_text(text: str) -> str:

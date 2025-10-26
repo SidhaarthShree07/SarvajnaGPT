@@ -60,7 +60,7 @@
             </div>
 
             <!-- Conversation area -->
-            <div class="w-full box-output overflow-y-auto px-3 md:px-6 mb-6 md:mb-8" style="max-height: 420px; min-height: 160px;">
+            <div ref="messagesBox" class="w-full box-output overflow-y-auto px-3 md:px-6 mb-6 md:mb-8" style="max-height: 420px; min-height: 160px;">
                 <div v-if="messages.length === 0" :class="[(darkMode || powerMode) ? 'text-gray-300/60' : 'text-gray-600/60','text-center py-8']">No conversation yet. Start translating!</div>
                 <div v-for="(msg, idx) in messages" :key="idx" class="flex items-start gap-3 mb-3" :class="msg.role === 'user' ? 'flex-row' : 'flex-row-reverse'" style="margin-bottom: 10px;">
                     <div class="flex-shrink-0">
@@ -193,6 +193,7 @@ const filteredLanguages = computed(() => {
 defineOptions({ name: 'TranslatorComponent' });
 // Imports must be at top
 import { ref, computed, toRef } from 'vue';
+import { nextTick } from 'vue';
 // Local UI state
 // Mobile UI: which side is active for typing
 const activeRole = ref('user');
@@ -228,6 +229,14 @@ const isListeningUser = ref(false);
 const isListeningOther = ref(false);
 
 const messages = ref([]); // {role: 'user'|'other', text, voiceUrl}
+const messagesBox = ref(null);
+
+function scrollToBottom() {
+    nextTick(() => {
+        const el = messagesBox.value;
+        if (el) el.scrollTop = el.scrollHeight;
+    });
+}
 
 // Bind the single textarea to the appropriate input based on activeRole
 const activeText = computed({
@@ -321,22 +330,45 @@ function sendTranslate(who, text) {
     }
     // Show the original message in the conversation
     messages.value.push({ role, text });
+    scrollToBottom();
     // Clear the input after sending
     if (who === 'user') userInput.value = ''; else otherInput.value = '';
-    // Use absolute backend URL if needed (supports dev/prod)
+    // Compute backend base (dev vite uses port 5173/4173 etc.)
     const ORIGIN = (typeof window !== 'undefined') ? window.location.origin : '';
-    const API_BASE = (ORIGIN && ORIGIN.startsWith('http')) ? ORIGIN : 'http://localhost:8000';
+    const isDevVite = /:(3000|5173|4173|5174)\b/.test(ORIGIN);
+    const API_BASE = isDevVite ? 'http://localhost:8000' : (ORIGIN || 'http://localhost:8000');
     const apiUrl = API_BASE + '/api/translate';
+
+    // Insert a placeholder assistant bubble while translating
+    const otherRole = role === 'user' ? 'other' : 'user';
+    const placeholder = { role: otherRole, text: 'Translating…' };
+    messages.value.push(placeholder);
+    const idx = messages.value.length - 1;
+    scrollToBottom();
     fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, from, to })
     })
-        .then(r => r.json())
+        .then(async (r) => {
+            let data;
+            try {
+                data = await r.json();
+            } catch {
+                const txt = await r.text();
+                data = { text: txt };
+            }
+            return data;
+        })
         .then(res => {
-            // Add translated message on the opposite side
-            const otherRole = role === 'user' ? 'other' : 'user';
-            messages.value.push({ role: otherRole, text: res.text });
+            console.debug('translate response:', res);
+            const out = (res && typeof res.text === 'string') ? res.text : '';
+            messages.value[idx] = { role: otherRole, text: out || '[no translation returned]' };
+            scrollToBottom();
+        })
+        .catch(err => {
+            messages.value[idx] = { role: otherRole, text: `Translation failed: ${String(err)}` };
+            scrollToBottom();
         });
 }
 
@@ -346,7 +378,8 @@ async function playAudio(urlOrText, lang) {
     if (typeof urlOrText === 'string' && urlOrText.startsWith('/static/')) {
         // Always use backend domain for static audio
     const ORIGIN = (typeof window !== 'undefined') ? window.location.origin : '';
-    const API_BASE = (ORIGIN && ORIGIN.startsWith('http')) ? ORIGIN : 'http://localhost:8000';
+    const isDevVite = /:(3000|5173|4173|5174)\b/.test(ORIGIN);
+    const API_BASE = isDevVite ? 'http://localhost:8000' : (ORIGIN || 'http://localhost:8000');
     const absUrl = API_BASE + urlOrText;
         console.log('Playing static audio URL:', absUrl);
         const audio = new Audio(absUrl);
@@ -356,7 +389,8 @@ async function playAudio(urlOrText, lang) {
     // Otherwise, generate TTS using /api/voice_chunk
     const text = cleanForTTS(urlOrText);
     const ORIGIN2 = (typeof window !== 'undefined') ? window.location.origin : '';
-    const API_BASE2 = (ORIGIN2 && ORIGIN2.startsWith('http')) ? ORIGIN2 : 'http://localhost:8000';
+    const isDevVite2 = /:(3000|5173|4173|5174)\b/.test(ORIGIN2);
+    const API_BASE2 = isDevVite2 ? 'http://localhost:8000' : (ORIGIN2 || 'http://localhost:8000');
     const apiUrl = API_BASE2 + '/api/voice_chunk';
     const res = await fetch(apiUrl, {
         method: 'POST',
@@ -374,7 +408,8 @@ async function playAudio(urlOrText, lang) {
             let playUrl = urls[0];
             if (playUrl.startsWith('/static/')) {
                 const ORIGIN3 = (typeof window !== 'undefined') ? window.location.origin : '';
-                const API_BASE3 = (ORIGIN3 && ORIGIN3.startsWith('http')) ? ORIGIN3 : 'http://localhost:8000';
+                const isDevVite3 = /:(3000|5173|4173|5174)\b/.test(ORIGIN3);
+                const API_BASE3 = isDevVite3 ? 'http://localhost:8000' : (ORIGIN3 || 'http://localhost:8000');
                 playUrl = API_BASE3 + playUrl;
             }
             // Play first chunk for now; can be extended to sequential playback

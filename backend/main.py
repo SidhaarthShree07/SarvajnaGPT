@@ -36,6 +36,7 @@ except Exception:
 from fastapi import FastAPI, Request, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from llm_inference import generate_response, summarize_text, answer_question, analyze_pdf, get_settings, set_settings
+from llm_inference import generate_response_with_options
 from llm_inference import get_model_name as llm_get_model_name, set_model_name as llm_set_model_name
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -1153,26 +1154,196 @@ class TranslateRequest(BaseModel):
 @app.post('/api/translate')
 async def translate_endpoint(request: Request):
     data = await request.json()
-    text = data.get('text', '')
-    from_lang = data.get('from') or data.get('from_lang') or 'en'
-    to_lang = data.get('to') or data.get('to_lang') or 'en'
-    # Use LLM to translate with professional translator system prompt
-    system_prompt = f"""
-You are a professional translator AI.  
-Your task is to translate text accurately, naturally, and in context.  
+    text = (data.get('text') or '').strip()
+    from_lang = (data.get('from') or data.get('from_lang') or 'en').strip()
+    to_lang = (data.get('to') or data.get('to_lang') or 'en').strip()
 
-Rules:
-1. Always translate from {from_lang} → {to_lang}.  
-2. Preserve meaning, tone, and style of the original text.  
-3. Do not add or omit information.  
-4. Keep placeholders, numbers, and formatting unchanged.  
-5. If the text is ambiguous, give the most natural interpretation.  
-6. Output only the translated text — no explanations unless asked.  
-"""
-    prompt = system_prompt + f"\nText: {text}"
-    translated = generate_response(prompt)
-    # Do NOT generate TTS here. Only return text.
-    return {"text": translated}
+    # Fast path: empty or same-language, just echo
+    if not text or from_lang.lower() == to_lang.lower():
+        return {"text": text}
+
+    # Stricter, low-temperature translation prompt to reduce hallucinations and transliteration
+    system_prompt = f"""
+You are a professional translator.
+Translate strictly from {from_lang} to {to_lang}.
+
+CRITICAL INSTRUCTIONS (must follow):
+1) OUTPUT ONLY THE TRANSLATED TEXT.
+2) DO NOT include any explanations, reasoning, notes, or labels.
+3) DO NOT wrap the translation in quotes or code fences.
+4) DO NOT transliterate. Use the native script of the target language (e.g., Hindi → Devanagari), unless the target language itself uses Latin.
+5) Preserve numbers, punctuation, placeholders, and formatting as-is.
+6) If the input is a common greeting or phrase, use the canonical, natural translation in the target language.
+7) YOUR RESPONSE SHOULD BE ONLY THE TRANSLATED TEXT IN THE TARGET LANGUAGE.
+If you produce anything besides the translated text, your answer is considered incorrect.
+""".strip()
+
+    few_shots = [
+        ("en", "hi", "good morning", "सुप्रभात"),
+        ("en", "hi", "good night", "शुभ रात्रि"),
+        ("en", "fr", "thank you", "merci"),
+    ]
+    shot_lines = []
+    for src, tgt, src_text, tgt_text in few_shots:
+        shot_lines.append(f"[{src}→{tgt}] {src_text} → {tgt_text}")
+    shots = "\n".join(shot_lines)
+
+    prompt = (
+        system_prompt
+        + "\n\nExamples (pattern only):\n"
+        + shots
+        + f"\n\n[{from_lang}→{to_lang}] {text} →"
+    )
+
+    import logging
+    import re
+    logging.debug(f"/api/translate from={from_lang} to={to_lang} text_len={len(text)}")
+    logging.debug(f"Translation prompt: {prompt[:500]}...")
+    raw = generate_response_with_options(prompt, temperature=0.05, max_tokens=96)
+    logging.debug(f"Raw model response: {raw}")
+
+    # Strategic cleanup to extract only translation text while preserving complete translations
+    cleaned = raw.strip()
+    
+    # 1. Remove ALL think/thuk tags and their entire contents first
+    cleaned = re.sub(r"<think[^>]*>.*?</think>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<thuk[^>]*>.*?</thuk>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"</?(?:think|thuk)[^>]*>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    
+    # 2. Remove code fences
+    cleaned = cleaned.replace("```", "")
+    
+    # 3. Remove long English explanation sentences (containing multiple explanation keywords)
+    # Split by periods and newlines
+    sentences = re.split(r'[.\n]+', cleaned)
+    filtered = []
+    
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        sent_lower = sent.lower()
+        
+        # Count explanation indicators
+        explanation_count = sum(1 for phrase in [
+            'okay', 'let me', 'user wants', 'translate', 'breaking down', 
+            'start by', 'common greeting', 'putting them together', 'should be'
+        ] if phrase in sent_lower)
+        
+        # Keep sentences with 0-1 explanation words (likely the translation itself)
+        # Discard sentences with 2+ explanation words (verbose reasoning)
+        if explanation_count <= 1:
+            filtered.append(sent)
+    
+    cleaned = ' '.join(filtered).strip()
+    
+    # 4. Remove parenthetical transliterations like "(namaste)" or "(dost)"
+    cleaned = re.sub(r'\([^)]*\)', '', cleaned)
+    
+    # 5. Remove quoted Latin-script words (transliterations) but keep quoted native script
+    cleaned = re.sub(r'"[a-zA-Z\s]+"', '', cleaned)
+    cleaned = re.sub(r"'[a-zA-Z\s]+'", '', cleaned)
+    
+    # 6. Remove standalone English prefixes/labels
+    prefixes = [
+        'Translation:', 'Translated:', 'Answer:', 'Output:', 'Result:',
+        'Here is the translation:', 'Here is:', "Here's:"
+    ]
+    for prefix in prefixes:
+        cleaned = re.sub(re.escape(prefix), '', cleaned, flags=re.IGNORECASE)
+    
+    # 7. Trim whitespace and quotes
+    cleaned = cleaned.strip().strip('`').strip('"').strip("'").strip()
+    
+    # 8. For non-Latin target languages, if there's still significant English text mixed in,
+    # extract only the native script portions
+    target_lang_lower = to_lang.lower()
+    if target_lang_lower in ['hi', 'ru', 'ar', 'ja', 'ko', 'zh-cn']:
+        # Check if cleaned has substantial Latin characters (more than 30% of non-space chars)
+        latin_count = sum(1 for c in cleaned if ord(c) < 128 and c.isalpha())
+        total_alpha = sum(1 for c in cleaned if c.isalpha())
+        
+        if total_alpha > 0 and (latin_count / total_alpha) > 0.3:
+            # Significant Latin text present, extract native script only
+            script_patterns = {
+                'hi': r'[\u0900-\u097F\s]+',
+                'ru': r'[\u0400-\u04FF\s]+',
+                'ar': r'[\u0600-\u06FF\s]+',
+                'ja': r'[\u3040-\u30FF\u4E00-\u9FFF\s]+',
+                'ko': r'[\u1100-\u11FF\uAC00-\uD7AF\s]+',
+                'zh-cn': r'[\u4E00-\u9FFF\s]+'
+            }
+            if target_lang_lower in script_patterns:
+                matches = re.findall(script_patterns[target_lang_lower], cleaned)
+                if matches:
+                    # Join all native script segments
+                    native_text = ' '.join(m.strip() for m in matches if m.strip())
+                    if native_text:
+                        cleaned = native_text
+    
+    result = cleaned if cleaned else raw.strip()
+
+    # If result is empty or looks malformed (e.g., stray markup), try a strict reminder pass
+    def _looks_bad(s: str) -> bool:
+        if not s or len(s.strip()) <= 1:
+            return True
+        if s.strip().startswith(('<', '`')):
+            return True
+        return False
+
+    if _looks_bad(result):
+        logging.debug("Result looks bad, attempting retry with stricter prompt")
+        reinforce1 = prompt + "\n\nREMINDER: Reply with ONLY the translation in the target language. Nothing else."
+        rawx = generate_response_with_options(reinforce1, temperature=0.05, max_tokens=96)
+        logging.debug(f"Retry raw response: {rawx}")
+        cleanedx = (rawx or "").strip().replace("```", "")
+        cleanedx = re.sub(r"<[^>]+>", "", cleanedx)
+        cleanedx = cleanedx.strip().strip('`').strip().strip('"').strip("'")
+        if cleanedx and len(cleanedx) > 1:
+            result = cleanedx
+
+    logging.debug(f"/api/translate final result: {result} (len={len(result)})")
+    return {"text": result}
+
+    # Script enforcement for some target languages to reduce romanized hallucinations
+    def contains_any(s: str, ranges: list[tuple[int,int]]) -> bool:
+        for ch in s:
+            cp = ord(ch)
+            for lo, hi in ranges:
+                if lo <= cp <= hi:
+                    return True
+        return False
+
+    script_ranges = {
+        'hi': [(0x0900, 0x097F)],           # Devanagari
+        'ru': [(0x0400, 0x04FF)],           # Cyrillic
+        'ar': [(0x0600, 0x06FF)],           # Arabic
+        'ja': [(0x3040, 0x30FF), (0x4E00, 0x9FFF)],  # Hiragana/Katakana + CJK
+        'ko': [(0x1100, 0x11FF), (0xAC00, 0xD7AF)],  # Jamo + Hangul
+        'zh-cn': [(0x4E00, 0x9FFF)],        # CJK Unified Ideographs
+    }
+
+    needs_native_script = to_lang.lower() in script_ranges
+    if needs_native_script and not contains_any(result, script_ranges[to_lang.lower()]):
+        # Second attempt: reinforce native script requirement
+        reinforce = prompt + "\n\nReminder: Use the native script of the target language. Do not transliterate. Output only the translated text."
+        raw2 = generate_response_with_options(reinforce, temperature=0.1, max_tokens=128)
+        cleaned2 = (raw2 or "").strip().replace("```", "")
+        cleaned2 = re.sub(r"<think[^>]*>[\s\S]*?</think>", "", cleaned2, flags=re.IGNORECASE)
+        cleaned2 = re.sub(r"<thuk[^>]*>[\s\S]*?</thuk>", "", cleaned2, flags=re.IGNORECASE)
+        cleaned2 = cleaned2.strip().strip('`').strip().strip('"').strip("'")
+        first2 = next((ln.strip() for ln in cleaned2.splitlines() if ln.strip()), "")
+        if first2 and contains_any(first2, script_ranges[to_lang.lower()]):
+            result = first2
+        else:
+            # Keep model output; no heuristic dictionary fallbacks (LLM-only as requested)
+            result = result
+
+    # No heuristic token maps or de-duplication; rely on LLM output with strict prompt and cleanup only
+
+    logging.debug(f"/api/translate result_len={len(result)}")
+    return {"text": result}
 
 # -------------------- Ollama Model Management --------------------
 import subprocess
