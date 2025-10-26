@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+requests
+pdfminer.six
+python-multipart
+Pillow
+numpy
+sentence-transformers
+torch

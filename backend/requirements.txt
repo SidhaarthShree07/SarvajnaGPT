@@ -1,0 +1,30 @@
+## Canonical backend dependency list
+## Grouping: core, docs/media, OCR/PDF, automation, language/LLM, speech, telemetry
+fastapi
+uvicorn[standard]
+requests
+sentence-transformers
+torch
+PyPDF2
+python-docx
+comtypes
+pywin32
+gtts
+lingua-language-detector
+numpy
+openpyxl
+python-pptx
+pydantic
+Pillow
+pdfminer.six
+python-multipart
+pytesseract
+pdf2image
+pypdfium2
+pymupdf
+pdfplumber
+litellm
+posthog
+soundfile
+coqui-tts
+pyperclip
