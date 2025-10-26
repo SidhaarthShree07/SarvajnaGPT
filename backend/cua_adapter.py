@@ -1620,6 +1620,265 @@ def _send_ctrl_v() -> bool:
         return False
 
 
+def _send_ctrl_c() -> bool:
+    """Simulate Ctrl+C to copy current selection. Returns True if keys were sent."""
+    if os.name != 'nt':
+        return False
+    try:
+        import ctypes as _ct, time as _t
+        KEYEVENTF_KEYUP = 0x0002
+        VK_CONTROL = 0x11
+        VK_C = 0x43
+        _ct.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        _t.sleep(0.01)
+        _ct.windll.user32.keybd_event(VK_C, 0, 0, 0)
+        _t.sleep(0.02)
+        _ct.windll.user32.keybd_event(VK_C, 0, KEYEVENTF_KEYUP, 0)
+        _t.sleep(0.01)
+        _ct.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        _t.sleep(0.01)
+        return True
+    except Exception:
+        return False
+
+
+def _get_clipboard_text() -> str | None:
+    """Read Unicode text from the Windows clipboard. Returns None on failure or if empty."""
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        CF_UNICODETEXT = 13
+        user32 = _ct.windll.user32
+        kernel32 = _ct.windll.kernel32
+        if not user32.OpenClipboard(None):
+            return None
+        try:
+            h_data = user32.GetClipboardData(CF_UNICODETEXT)
+            if not h_data:
+                return None
+            ptr = kernel32.GlobalLock(h_data)
+            if not ptr:
+                return None
+            try:
+                data = _ct.wstring_at(ptr)
+                return data if data else None
+            finally:
+                kernel32.GlobalUnlock(h_data)
+        finally:
+            user32.CloseClipboard()
+    except Exception:
+        return None
+
+def _send_ctrl_key(vk_key: int) -> bool:
+    if os.name != 'nt':
+        return False
+    try:
+        import ctypes as _ct, time as _t
+        KEYEVENTF_KEYUP = 0x0002
+        VK_CONTROL = 0x11
+        _ct.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        _t.sleep(0.01)
+        _ct.windll.user32.keybd_event(vk_key, 0, 0, 0)
+        _t.sleep(0.02)
+        _ct.windll.user32.keybd_event(vk_key, 0, KEYEVENTF_KEYUP, 0)
+        _t.sleep(0.01)
+        _ct.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        _t.sleep(0.01)
+        return True
+    except Exception:
+        return False
+
+def _send_key(vk_key: int) -> bool:
+    if os.name != 'nt':
+        return False
+    try:
+        import ctypes as _ct, time as _t
+        KEYEVENTF_KEYUP = 0x0002
+        _ct.windll.user32.keybd_event(vk_key, 0, 0, 0)
+        _t.sleep(0.02)
+        _ct.windll.user32.keybd_event(vk_key, 0, KEYEVENTF_KEYUP, 0)
+        _t.sleep(0.01)
+        return True
+    except Exception:
+        return False
+
+def capture_full_document_text_and_restore_selection(original_preview: str | None = None, max_chars: int = 200000) -> dict:
+    """Capture entire document text from the foreground app (e.g., Word) and attempt to restore selection.
+
+    Steps:
+    - Save clipboard
+    - Ctrl+A, Ctrl+C => doc_text
+    - If original_preview provided, try to reselect via Ctrl+F -> paste -> Enter -> Esc
+    - Restore clipboard
+    Returns { ok, text, restored, errors }
+    """
+    import time as _t
+    errors: list[str] = []
+    try:
+        prior = _get_clipboard_text()
+    except Exception as e:
+        errors.append(f"clipboard_read_failed:{str(e)[:80]}")
+        prior = None
+    # Ctrl+A
+    try:
+        VK_A = 0x41
+        _ = _send_ctrl_key(VK_A)
+        _t.sleep(0.05)
+    except Exception:
+        errors.append('ctrl_a_failed')
+    # Ctrl+C
+    try:
+        _ = _send_ctrl_c()
+        _t.sleep(0.08)
+    except Exception:
+        errors.append('ctrl_c_failed')
+    doc_text = _get_clipboard_text() or ''
+    if doc_text and max_chars and len(doc_text) > max_chars:
+        doc_text = doc_text[:max_chars]
+    # Try to reselect original preview
+    restored = False
+    try:
+        if (original_preview or '').strip():
+            # Ctrl+F
+            VK_F = 0x46; VK_RETURN = 0x0D; VK_ESCAPE = 0x1B
+            _send_ctrl_key(VK_F); _t.sleep(0.08)
+            # Paste the original preview into the Find box
+            _set_clipboard_text(original_preview or '')
+            _t.sleep(0.02)
+            _send_ctrl_v(); _t.sleep(0.06)
+            # Enter to search, then Esc to close pane
+            _send_key(VK_RETURN); _t.sleep(0.1)
+            _send_key(VK_ESCAPE); _t.sleep(0.05)
+            restored = True
+    except Exception:
+        restored = False
+    # Restore clipboard
+    try:
+        if prior is not None:
+            _set_clipboard_text(prior)
+    except Exception:
+        pass
+    return {
+        'ok': True,
+        'text': doc_text,
+        'restored': bool(restored),
+        'errors': errors,
+    }
+
+def capture_inline_selection(max_preview_chars: int = 1200) -> dict:
+    """Best-effort capture of current selection text from the foreground app.
+
+    Strategy:
+    - Record current clipboard text (Unicode), if any
+    - Send Ctrl+C to copy
+    - Read clipboard text; if non-empty, treat as selection
+    - Restore prior clipboard text (Unicode only) to minimize disruption
+    Returns dict with {ok, selections: [{source, label, preview, length, timestamp}], primary}
+    """
+    import time as _t
+    errors: list[str] = []
+    try:
+        prior = _get_clipboard_text()
+    except Exception as e:
+        prior = None
+        errors.append(f"clipboard_read_failed:{str(e)[:80]}")
+    sent = _send_ctrl_c()
+    _t.sleep(0.06)
+    sel_text = _get_clipboard_text() or ''
+    # Restore clipboard to prior state (Unicode only)
+    try:
+        if prior is not None:
+            _set_clipboard_text(prior)
+    except Exception:
+        pass
+    focused_name = ''
+    try:
+        focused_name = get_focused_window_name()
+    except Exception:
+        focused_name = ''
+    preview = (sel_text or '').strip()
+    if preview and len(preview) > max_preview_chars:
+        preview = preview[:max_preview_chars]
+    ts = int(_t.time())
+    out: dict = {
+        'ok': True,
+        'errors': errors,
+        'selections': [],
+        'primary': 'foreground',
+    }
+    if preview:
+        out['selections'] = [{
+            'source': 'foreground',
+            'label': focused_name or 'Target',
+            'preview': preview,
+            'length': len(sel_text or ''),
+            'timestamp': ts,
+        }]
+    return out
+
+def get_clipboard_text_preview(max_preview_chars: int = 1200) -> dict:
+    """Active selection capture: sends Ctrl+C to grab current selection, then restores clipboard.
+
+    Does not change focus, but DOES send Ctrl+C to copy whatever is currently selected
+    in the foreground app, then restores the prior clipboard content.
+    Returns dict with the same shape as capture_inline_selection but with primary 'clipboard'.
+    """
+    import time as _t
+    errors: list[str] = []
+    # Save prior clipboard
+    try:
+        prior = _get_clipboard_text()
+    except Exception as e:
+        prior = None
+        errors.append(f"clipboard_save_failed:{str(e)[:80]}")
+    
+    # Send Ctrl+C to copy current selection (without changing focus)
+    sent = _send_ctrl_c()
+    _t.sleep(0.06)
+    
+    # Read clipboard
+    try:
+        clip = _get_clipboard_text() or ''
+    except Exception as e:
+        clip = ''
+        errors.append(f"clipboard_read_failed:{str(e)[:80]}")
+    
+    # Restore prior clipboard
+    try:
+        if prior is not None:
+            _set_clipboard_text(prior)
+    except Exception as e:
+        errors.append(f"clipboard_restore_failed:{str(e)[:80]}")
+    
+    # Determine source from focused window name
+    focused_name = ''
+    try:
+        focused_name = get_focused_window_name()
+    except Exception:
+        focused_name = ''
+    
+    preview = (clip or '').strip()
+    if preview and len(preview) > max_preview_chars:
+        preview = preview[:max_preview_chars]
+    ts = int(_t.time())
+    out: dict = {
+        'ok': True,
+        'errors': errors,
+        'selections': [],
+        'primary': 'foreground',
+    }
+    if preview:
+        out['selections'] = [{
+            'source': 'foreground',
+            'label': focused_name or 'Target',
+            'preview': preview,
+            'length': len(clip or ''),
+            'timestamp': ts,
+        }]
+    return out
+
 def _click_center_of_foreground(dx: int = 0, dy: int = 0) -> bool:
     """Click approximately the center of the current foreground window (best-effort)."""
     if os.name != 'nt':

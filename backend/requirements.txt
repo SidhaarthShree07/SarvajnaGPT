@@ -27,3 +27,4 @@ litellm
 posthog
 soundfile
 coqui-tts
+pyperclip

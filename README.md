@@ -71,9 +71,10 @@ Planned mobile enhancements (roadmap): in-chat audio recording button, simplifie
       - Open or reuse an existing VS Code window for a target file (no duplicate instance spam)
       - Force split-screen with the current foreground window (left or right side) using Snap Assist heuristics
       - Prefer CUA-driven Snap selection when the CUA agent is healthy; gracefully fall back to native Win+Arrow snapping
-   - Word automation (COM)
-      - Create new or open existing .docx files, insert/append text, optionally save to a sandbox path
-      - Optional auto-split with the initiating window for side-by-side editing
+   - Word assistance (clipboard‑first)
+      - Create new or open existing .docx files and append/insert text when requested
+      - Default flow: generate enhanced text and copy it to your clipboard for manual paste (preserves split layout and formatting)
+      - Optional/experimental: direct automation via COM and window focus when explicitly enabled
    - Adaptive snapping strategy
       - Primary: CUA enumerates and selects Snap layout tiles programmatically (fewer keystroke heuristics)
       - Fallback: deterministic Win + Arrow key sequences to achieve target half-side when CUA is unavailable
@@ -95,7 +96,33 @@ Planned mobile enhancements (roadmap): in-chat audio recording button, simplifie
    backend/cua/                   # Cloned upstream CUA project (auto via run.py)
    ```
 
-   Result: When the agent "opens a file in VS Code" or "types into Word and split-screens", the action is reliable, reuses windows, and adapts to environment capabilities without exposing low-level complexity to the user.
+   Result: When the agent "opens a file in VS Code" or assists with Word editing side-by-side, the action is reliable, reuses windows, and adapts to environment capabilities. By default, Word edits are clipboard‑based to avoid focus disruptions; direct automation remains optional/experimental.
+
+### Word selection enhancement: select → send → paste
+
+If you select text in Word and ask the Research Assistant to improve it (for example: "explain in more detail"), SarvajñaGPT will:
+
+1) Detect the current selection in Word (non-invasive, via clipboard polling that preserves your clipboard contents)
+2) Use the full document content as context (resolved from your active chat state) to generate an improved snippet
+3) Copy only the enhanced snippet to your clipboard
+4) Prompt you to switch to Word and press Ctrl+V to replace the selection
+
+Notes
+- This clipboard‑first flow avoids window focus churn and preserves your split layout and formatting.
+- If selection monitoring is disabled, you can enable it from the Power Mode panel; permission prompts may appear in the browser.
+- Direct automation (auto-replace in Word) is available but intentionally disabled by default as it can disrupt focus/splits in some setups.
+
+### Triple-window layout for HTML/CSS
+
+For frontend work, SarvajñaGPT can operate comfortably with a tri-split layout:
+
+- Left: SarvajñaGPT (chat, instructions, Power Mode)
+- Center: VS Code (HTML/CSS/JS editor)
+- Right: Browser preview (Vite dev server or static preview)
+
+Notes
+- Tri-split relies on your OS window manager (Windows 11 Snap layouts work best) and is best-effort; if unavailable, it falls back to side-by-side.
+- You can manually arrange the three windows, and the automation will generally respect the existing layout without attempting to reflow it.
 
 ## Installation
 
@@ -205,6 +232,10 @@ SarvajñaGPT/
    - You can run the shown `ollama pull <model>` command manually in PowerShell
 - Responses look odd
    - Try a different model from the selector, or adjust your tags to refine context
+- Word selection isn’t detected or pastes don’t appear
+   - Ensure selection monitoring is enabled in the Power Mode UI and allow clipboard permissions in the browser when prompted
+   - Reselect text in Word and press Ctrl+C once; then retry your request
+   - The app copies the enhanced snippet to your clipboard—switch to Word and press Ctrl+V to replace the selection manually
 
 ## Why SarvajñaGPT vs. other local AI options?
 

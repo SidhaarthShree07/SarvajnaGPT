@@ -31,6 +31,11 @@ try:  # Prefer package-relative, then bare
         select_snap_assist_tile,
         snap_current_and_select,
         open_path as cua_open_path,
+        capture_inline_selection,
+        get_clipboard_text_preview,
+        ensure_focus_top,
+        focus_previous_window,
+        focus_window_by_tokens,
     )  # type: ignore
 except Exception:  # pragma: no cover
     try:
@@ -39,6 +44,11 @@ except Exception:  # pragma: no cover
             select_snap_assist_tile,
             snap_current_and_select,
             open_path as cua_open_path,
+            capture_inline_selection,
+            get_clipboard_text_preview,
+            ensure_focus_top,
+            focus_previous_window,
+            focus_window_by_tokens,
         )  # type: ignore
     except Exception:
         cua_runtime_status = None  # type: ignore
@@ -151,22 +161,133 @@ def shim_info() -> Dict[str, Any]:
             "/api/automation/word/execute",
             "/api/automation/word/open_existing",
             "/api/automation/inline-selection",
+            "/api/automation/inline-selection/passive",
+            "/api/automation/inline-selection/assist",
         ],
     }
+# Active clipboard selection (sends Ctrl+C but does not change focus)
+@router.get("/inline-selection/passive")
+def inline_selection_passive() -> Dict[str, Any]:
+    """Capture current selection via Ctrl+C without changing window focus.
+    
+    Sends Ctrl+C to copy selection, reads clipboard, then restores prior clipboard content.
+    Works with any app (Word, browser, Code, etc.) as long as text is selected.
+    """
+    try:
+        if callable(get_clipboard_text_preview):  # type: ignore[truthy-bool]
+            res = get_clipboard_text_preview()  # type: ignore[misc]
+            if isinstance(res, dict):
+                res.setdefault('ok', True)
+                res.setdefault('selections', [])
+                res.setdefault('primary', 'foreground')
+                if not res.get('selections'):
+                    res.setdefault('reason', 'No active selection detected')
+                return res
+    except Exception as e:
+        return {"ok": True, "selections": [], "primary": "foreground", "errors": [str(e)[:160]]}
+    return {"ok": True, "selections": [], "primary": "foreground", "reason": "No active selection detected"}
 
 
 # Minimal inline selection endpoint for backward compatibility
 @router.get("/inline-selection")
 def inline_selection() -> Dict[str, Any]:
+    """Return best-effort snapshot of current inline selection from the foreground window.
+
+    Response shape:
+    { ok: bool, selections: [ { source, label, preview, length, timestamp } ], primary: 'foreground', errors?: [] }
+    """
     try:
-        status = _status()
-    except Exception:
-        status = {"available": False}
+        if callable(capture_inline_selection):  # type: ignore[truthy-bool]
+            res = capture_inline_selection()  # type: ignore[misc]
+            if isinstance(res, dict):
+                # Ensure required fields are present for the frontend
+                res.setdefault('ok', True)
+                res.setdefault('selections', [])
+                res.setdefault('primary', 'foreground')
+                return res
+    except Exception as e:
+        return {"ok": True, "selections": [], "primary": "foreground", "errors": [str(e)[:160]]}
+    # Fallback when helper unavailable
+    st = _status()
     return {
         "ok": True,
-        "available": bool(status.get("core_import") or status.get("repo_dir_present")),
-        "status": status,
-        "note": "inline-selection is a compatibility no-op in CUA-only mode",
+        "selections": [],
+        "primary": "foreground",
+        "errors": ["capture_inline_selection_unavailable"],
+        "status": st,
+        "reason": "No active selection detected",
+    }
+
+
+# Assisted inline selection that momentarily focuses a target app before copying,
+# then returns focus back (best-effort). Useful when the browser has focus.
+@router.get("/inline-selection/assist")
+def inline_selection_assist(target: str = "word") -> Dict[str, Any]:
+    """Attempt to capture selection from a specific target app by focusing it briefly.
+
+    Query params:
+    - target: 'word' | 'code' | 'browser' (defaults to 'word')
+
+    Returns the same shape as /inline-selection, plus {assisted: true, target, focus: {focused: bool, restored: bool}}
+    """
+    # Map targets to common window title tokens; diacritics are normalized in helper
+    target = (target or "").strip().lower() or "word"
+    token_map = {
+        "word": ["microsoft word", "word"],
+        "code": ["visual studio code", "vs code", "vscode", "code"],
+        # Generic browser fallback; we can't know exact tab title reliably here
+        "browser": ["microsoft edge", "edge", "google chrome", "chrome", "mozilla firefox", "firefox", "brave"],
+    }
+    toks = token_map.get(target, token_map["word"])
+    focused_ok = False
+    restored_ok = False
+    try:
+        if callable(ensure_focus_top):  # type: ignore[truthy-bool]
+            focused_ok = bool(ensure_focus_top(toks))  # type: ignore[misc]
+    except Exception:
+        focused_ok = False
+
+    # Perform the capture either way (if focus fails, this mirrors the basic endpoint outcome)
+    try:
+        if callable(capture_inline_selection):  # type: ignore[truthy-bool]
+            res = capture_inline_selection()  # type: ignore[misc]
+        else:
+            res = {"ok": True, "selections": [], "primary": "foreground", "errors": ["capture_inline_selection_unavailable"]}
+    except Exception as e:
+        res = {"ok": True, "selections": [], "primary": "foreground", "errors": [str(e)[:160]]}
+
+    # Best-effort return of focus back to the previous app (Alt+Tab once)
+    try:
+        if callable(focus_previous_window):  # type: ignore[truthy-bool]
+            restored_ok = bool(focus_previous_window())  # type: ignore[misc]
+    except Exception:
+        restored_ok = False
+
+    if isinstance(res, dict):
+        res.setdefault('ok', True)
+        res.setdefault('selections', [])
+        res.setdefault('primary', 'foreground')
+        res['assisted'] = True
+        res['target'] = target
+        res['focus'] = {'focused': bool(focused_ok), 'restored': bool(restored_ok)}
+        # If nothing captured, provide a clearer reason
+        if (not res.get('selections')):
+            msg = f"No active selection detected (assisted {target})"
+            # Only set reason/message if not already provided
+            if 'reason' not in res:
+                res['reason'] = msg
+            if 'message' not in res:
+                res['message'] = msg
+        return res
+    # Fallback guaranteed shape
+    return {
+        'ok': True,
+        'selections': [],
+        'primary': 'foreground',
+        'assisted': True,
+        'target': target,
+        'focus': {'focused': bool(focused_ok), 'restored': bool(restored_ok)},
+        'reason': f'No active selection detected (assisted {target})',
     }
 
 

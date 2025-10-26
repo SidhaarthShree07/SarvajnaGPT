@@ -98,3 +98,7 @@ After build, restart (or start) the backend and open http://192.168.29.53:8000 �
 - “No models found”: Confirm Ollama is running; try Refresh in the modal
 - Install failed: Check internet and disk space; you can run `ollama pull <model>` manually in PowerShell
 - Poor output quality: Try a different model from the selector or refine context using #tags in the Memory Manager
+ - Word integration (selection/paste):
+   - If selection isn’t detected, enable selection monitoring in the Power Mode UI and approve clipboard access in the browser if prompted
+   - Reselect text in Word and press Ctrl+C once to refresh the selection state, then send your prompt again
+   - By default, enhanced text is copied to your clipboard; switch to Word and press Ctrl+V to replace your current selection manually (preserves split and formatting)

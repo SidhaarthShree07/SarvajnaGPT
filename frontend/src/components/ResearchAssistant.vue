@@ -318,17 +318,10 @@
                                 <div class="text-xs leading-snug whitespace-pre-wrap text-emerald-700/90">
                                     {{ inlineSelectionSummary.preview }}</div>
                                 <div class="flex items-center gap-2 text-[11px]">
-                                    <button @click="refreshInlineSelection()" :disabled="inlineSelectionLoading"
-                                        class="flex items-center gap-1 rounded bg-emerald-500/90 px-2 py-1 text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60">
-                                        <span v-if="inlineSelectionLoading"
-                                            class="material-symbols-outlined text-sm animate-spin">sync</span>
-                                        <span v-else class="material-symbols-outlined text-sm">refresh</span>
-                                        Refresh
-                                    </button>
-                                    <button @click="clearInlineSelectionIndicator"
-                                        class="flex items-center gap-1 rounded px-2 py-1 text-emerald-700 transition hover:text-emerald-900">
-                                        <span class="material-symbols-outlined text-sm">close_small</span>
-                                        Hide
+                                    <button @click="disableInlineSelection"
+                                        class="flex items-center gap-1 rounded bg-red-500/90 px-2 py-1 text-white transition hover:bg-red-600">
+                                        <span class="material-symbols-outlined text-sm">close</span>
+                                        Remove Selection
                                     </button>
                                 </div>
                             </div>
@@ -337,12 +330,7 @@
                             class="mb-2 flex w-full items-center gap-2 rounded-xl border border-gray-200 bg-white/80 px-3 py-2 text-[12px] text-gray-600">
                             <span class="material-symbols-outlined text-base text-gray-500">info</span>
                             <span class="leading-snug">{{ inlineSelectionMessage }}</span>
-                            <button v-if="!inlineSelectionLoading" @click="refreshInlineSelection()"
-                                class="ml-auto flex items-center gap-1 text-[11px] font-semibold text-orange-500 transition hover:text-orange-600">
-                                <span class="material-symbols-outlined text-sm">refresh</span>
-                                Retry
-                            </button>
-                            <span v-else class="ml-auto text-[10px] uppercase tracking-wide text-gray-400">Working…</span>
+                            <span v-if="inlineSelectionLoading" class="ml-auto text-[10px] uppercase tracking-wide text-gray-400">Working…</span>
                         </div>
 
                         <div class="flex items-center w-full p-2 bg-white/50 rounded-full shadow-inner">
@@ -361,9 +349,12 @@
                             </button>
 
                             <!-- Inline selection refresh button -->
-                            <button @click="refreshInlineSelection()" :disabled="inlineSelectionLoading || isSending"
-                                :title="inlineSelectionLoading ? 'Checking selection…' : 'Check inline selection'"
-                                class="mr-2 w-8 h-8 flex items-center justify-center rounded-full bg-emerald-100/60 text-emerald-600 hover:bg-emerald-200/70 transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-60" style="margin-left: 5px;">
+                            <button @click="enableInlineSelection" :disabled="inlineSelectionLoading || isSending"
+                                :title="inlineSelectionData ? 'Selection monitoring active' : 'Enable selection monitoring'"
+                                :class="[
+                                    'mr-2 w-8 h-8 flex items-center justify-center rounded-full transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-60',
+                                    inlineSelectionData ? 'bg-emerald-500/90 text-white' : 'bg-emerald-100/60 text-emerald-600 hover:bg-emerald-200/70'
+                                ]" style="margin-left: 5px;">
                                 <span v-if="inlineSelectionLoading" class="material-symbols-outlined text-lg animate-spin">sync</span>
                                 <span v-else class="material-symbols-outlined text-lg">edit_note</span>
                             </button>
@@ -1115,6 +1106,7 @@ const API_URL = API_BASE + '/api/chat';
 // power_router mounts under the /api/power prefix, so endpoints are /api/power/power_chat etc.
 const POWER_CHAT_URL = API_BASE + '/api/power/power_chat';
 const POWER_EXECUTE_URL = API_BASE + '/api/power/power_execute';
+const WORD_ENHANCE_SELECTION_URL = API_BASE + '/api/power/word/enhance_selection';
 const AUTOPLAN_URL = API_BASE + '/api/agent/autoplan';
 const FILE_URL = API_BASE + '/api/upload';
 const CHATS_URL = API_BASE + '/api/chats';
@@ -1123,7 +1115,9 @@ const CHAT_STATE_URL = API_BASE + '/api/chat_state/';
 // Endpoint for intelligently opening documents with the appropriate application
 const OPEN_DOC_INTELLIGENTLY_URL = API_BASE + '/api/power/open_doc_intelligently_direct';
 const DELETE_CHAT_URL = API_BASE + '/api/chat/';
-const INLINE_SELECTION_URL = API_BASE + '/api/automation/inline-selection';
+// Kept for compatibility but not used in passive-first flow
+// const INLINE_SELECTION_URL = API_BASE + '/api/automation/inline-selection';
+const INLINE_SELECTION_PASSIVE_URL = API_BASE + '/api/automation/inline-selection/passive';
 
 import { ref, onMounted, nextTick, toRef, watch, computed } from 'vue';
 // accept darkMode as a prop from parent (App.vue) so the value stays reactive
@@ -1157,6 +1151,11 @@ const inlineSelectionData = ref(null);
 const inlineSelectionLoading = ref(false);
 const inlineSelectionError = ref('');
 const inlineSelectionShouldReport = ref(false);
+const lastClipboardText = ref('');
+let clipboardMonitorInterval = null;
+
+// Saved selection text for Word enhancement (persists until send or clear)
+const savedSelectionText = ref('');
 
 const inlineSelectionSummary = computed(() => {
     const data = inlineSelectionData.value;
@@ -1285,26 +1284,63 @@ async function refreshInlineSelection(quiet = false) {
         inlineSelectionShouldReport.value = true;
     }
     try {
-        const res = await fetch(INLINE_SELECTION_URL, { cache: 'no-store' });
-        if (!res.ok) throw new Error(`Selection probe failed (HTTP ${res.status})`);
-        const data = await res.json();
-        const hasSelections = data && Array.isArray(data.selections) && data.selections.length > 0;
-        if (hasSelections) {
-            inlineSelectionData.value = data;
+        // Always read fresh clipboard text
+        let clipboardText = '';
+        let useClipboardAPI = false;
+        try {
+            if (navigator.clipboard && navigator.clipboard.readText) {
+                clipboardText = await navigator.clipboard.readText();
+                if (clipboardText && clipboardText.trim().length > 0) {
+                    useClipboardAPI = true;
+                    // Update last known clipboard text
+                    lastClipboardText.value = clipboardText;
+                    console.debug('Got selection from browser Clipboard API:', clipboardText.length, 'chars');
+                }
+            }
+        } catch (clipErr) {
+            console.debug('Clipboard API failed (user may need to grant permission or copy first):', clipErr);
+        }
+
+        if (useClipboardAPI && clipboardText.trim()) {
+            // Build selection object from clipboard
+            const preview = clipboardText.trim().slice(0, 1200);
+            const ts = Math.floor(Date.now() / 1000);
+            inlineSelectionData.value = {
+                ok: true,
+                selections: [{
+                    source: 'clipboard',
+                    label: 'Clipboard (from Word/App)',
+                    preview: preview,
+                    length: clipboardText.length,
+                    timestamp: ts,
+                }],
+                primary: 'clipboard',
+            };
             inlineSelectionError.value = '';
             inlineSelectionShouldReport.value = false;
         } else {
-            inlineSelectionData.value = null;
-            if (!quiet) {
-                const message = (data && (data.message || data.reason)) ? (data.message || data.reason) : 'No active selection detected';
-                inlineSelectionError.value = message;
-                inlineSelectionShouldReport.value = true;
-            } else {
+            // Fallback to backend (sends Ctrl+C)
+            let res = await fetch(INLINE_SELECTION_PASSIVE_URL, { cache: 'no-store' });
+            if (!res.ok) throw new Error(`Selection probe failed (HTTP ${res.status})`);
+            let data = await res.json();
+            let hasSelections = data && Array.isArray(data.selections) && data.selections.length > 0;
+            if (hasSelections) {
+                inlineSelectionData.value = data;
+                inlineSelectionError.value = '';
                 inlineSelectionShouldReport.value = false;
+            } else {
+                inlineSelectionData.value = null;
+                if (!quiet) {
+                    const message = (data && (data.message || data.reason)) ? (data.message || data.reason) : 'No active selection detected (try copying with Ctrl+C)';
+                    inlineSelectionError.value = message;
+                    inlineSelectionShouldReport.value = true;
+                } else {
+                    inlineSelectionShouldReport.value = false;
+                }
             }
-        }
-        if (data && Array.isArray(data.errors) && data.errors.length > 0) {
-            console.debug('Inline selection diagnostics:', data.errors);
+            if (data && Array.isArray(data.errors) && data.errors.length > 0) {
+                console.debug('Inline selection diagnostics:', data.errors);
+            }
         }
     } catch (err) {
         inlineSelectionData.value = null;
@@ -1322,10 +1358,88 @@ function handleInputFocus() {
     refreshInlineSelection(true);
 }
 
-function clearInlineSelectionIndicator() {
+// Kept for compatibility but replaced by disableInlineSelection
+// function clearInlineSelectionIndicator() {
+//     inlineSelectionData.value = null;
+//     inlineSelectionError.value = '';
+//     inlineSelectionShouldReport.value = false;
+// }
+
+// Start automatic clipboard monitoring when Power Mode is enabled
+function startClipboardMonitoring() {
+    if (clipboardMonitorInterval) return; // Already running
+    
+    // Initialize with current clipboard
+    (async () => {
+        try {
+            if (navigator.clipboard && navigator.clipboard.readText) {
+                lastClipboardText.value = await navigator.clipboard.readText();
+            }
+        } catch {
+            // Ignore initial read error
+        }
+    })();
+    
+    clipboardMonitorInterval = setInterval(async () => {
+        if (!powerMode.value) {
+            // Stop monitoring if Power Mode is disabled
+            stopClipboardMonitoring();
+            return;
+        }
+        
+        try {
+            if (navigator.clipboard && navigator.clipboard.readText) {
+                const clipText = await navigator.clipboard.readText();
+                if (clipText && clipText.trim() && clipText !== lastClipboardText.value) {
+                    // New text copied - auto refresh and save
+                    console.debug('New clipboard text detected, auto-refreshing selection');
+                    lastClipboardText.value = clipText;
+                    savedSelectionText.value = clipText; // Save for later use
+                    await refreshInlineSelection(true); // quiet mode
+                }
+            }
+        } catch {
+            // Silently ignore clipboard permission errors
+        }
+    }, 300); // Check every 300ms for faster detection
+}
+
+function stopClipboardMonitoring() {
+    if (clipboardMonitorInterval) {
+        clearInterval(clipboardMonitorInterval);
+        clipboardMonitorInterval = null;
+    }
+}
+
+// Enable inline selection and start monitoring
+function enableInlineSelection() {
+    if (!powerMode.value) {
+        inlineSelectionError.value = 'Enable Power Mode to work with inline selections.';
+        inlineSelectionShouldReport.value = true;
+        return;
+    }
+    // Start monitoring
+    startClipboardMonitoring();
+    // Do an immediate check and save
+    refreshInlineSelection(false).then(() => {
+        // Save the initial selection if available
+        const preview = getFreshInlineSelectionPreview();
+        if (preview) {
+            savedSelectionText.value = preview;
+        }
+    });
+}
+
+// Disable inline selection and stop monitoring
+function disableInlineSelection() {
+    // Stop monitoring
+    stopClipboardMonitoring();
+    // Clear selection data
     inlineSelectionData.value = null;
     inlineSelectionError.value = '';
     inlineSelectionShouldReport.value = false;
+    lastClipboardText.value = '';
+    savedSelectionText.value = ''; // Clear saved selection
 }
 
 const acceptedFileTypes = ['.pdf', '.txt', '.doc', '.docx', '.md', '.csv', '.json'];
@@ -1586,13 +1700,116 @@ async function sendMessage() {
         }
 
         if (powerMode.value) {
-            const inlineSelectionPreview = getFreshInlineSelectionPreview();
+            // Use saved selection text instead of re-checking freshness
+            const selectionText = savedSelectionText.value.trim();
+            
+            // Check if we should trigger Word enhancement workflow
+            const monitoringActive = !!clipboardMonitorInterval;
+            
+            // Word enhancement is triggered when:
+            // 1. Valid saved selection exists
+            // 2. Monitoring is active (user clicked green button)
+            // 3. Selection length suggests it's meaningful content (not just a few characters)
+            const shouldEnhanceWord = !!selectionText && 
+                                      monitoringActive && 
+                                      selectionText.length > 10;
+            
+            if (shouldEnhanceWord) {
+                console.log('\n' + '='.repeat(80));
+                console.log('WORD ENHANCEMENT - FRONTEND DEBUG');
+                console.log('='.repeat(80));
+                console.log('1. SELECTION DATA:');
+                console.log('   Selection length:', selectionText.length);
+                console.log('   Selection preview:', selectionText.slice(0, 200));
+                console.log('   Chat ID:', selectedChatId.value);
+                console.log('   Monitoring active:', monitoringActive);
+                console.log('   User prompt:', messageText);
+                
+                // Word enhancement: send selection + chat_id to backend
+                try {
+                    console.log('\n2. SENDING REQUEST TO BACKEND...');
+                    const requestBody = {
+                        prompt: messageText,
+                        selection_text: selectionText,
+                        chat_id: selectedChatId.value,
+                        max_full_context_chars: 60000,
+                        rich: true,
+                    };
+                    console.log('   Request body:', requestBody);
+                    
+                    const enhanceRes = await fetch(WORD_ENHANCE_SELECTION_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(requestBody)
+                    });
+                    
+                    console.log('\n3. BACKEND RESPONSE:');
+                    console.log('   Status:', enhanceRes.status, enhanceRes.statusText);
+                    
+                    console.log('\n3. BACKEND RESPONSE:');
+                    console.log('   Status:', enhanceRes.status, enhanceRes.statusText);
+                    
+                    if (!enhanceRes.ok) {
+                        const errData = await enhanceRes.json().catch(() => ({ detail: 'Unknown error' }));
+                        console.error('   ERROR:', errData);
+                        throw new Error(errData.detail || 'Word enhancement failed');
+                    }
+                    const enhanceData = await enhanceRes.json();
+                    console.log('   Success! Response data:');
+                    console.log('   - ok:', enhanceData.ok);
+                    console.log('   - clipboard_copied:', enhanceData.clipboard_copied);
+                    console.log('   - doc_source:', enhanceData.doc_source);
+                    console.log('   - llm_output_length:', enhanceData.llm_output_length);
+                    console.log('   - enhanced_text_preview:', enhanceData.enhanced_text_preview);
+                    console.log('   Full response:', enhanceData);
+                    
+                    console.log('\n4. UPDATING UI...');
+                    // Show completion message with instructions
+                    const completionMsg = {
+                        sender: 'ai',
+                        text: enhanceData.clipboard_copied 
+                            ? `✓ Enhanced text copied to clipboard!\n\n📋 **Instructions:**\n1. **Select the original text** in Word (the text you want to replace)\n2. Press **Ctrl+V** to paste the enhanced version\n\nThe enhanced text is ready in your clipboard.`
+                            : '⚠ Enhancement complete but clipboard copy failed. Please check the backend logs.',
+                        timestamp: Date.now(),
+                    };
+                    messages.value.push(completionMsg);
+                    console.log('   Completion message added to chat');
+                    
+                    // Always clear selection after enhancement
+                    console.log('   Clearing selection');
+                    disableInlineSelection();
+                    
+                    scrollToBottom();
+                    isSending.value = false;
+                    console.log('\n5. WORD ENHANCEMENT COMPLETE');
+                    console.log('='.repeat(80) + '\n');
+                    return; // Skip normal chat flow
+                } catch (err) {
+                    console.error('\n❌ WORD ENHANCEMENT ERROR:');
+                    console.error(err);
+                    console.log('='.repeat(80) + '\n');
+                    // Show error but continue to normal chat as fallback
+                    const errorMsg = {
+                        sender: 'ai',
+                        text: `⚠ Word enhancement failed: ${err instanceof Error ? err.message : String(err)}. Continuing with normal chat...`,
+                        timestamp: Date.now(),
+                    };
+                    messages.value.push(errorMsg);
+                }
+            }
+            
+            // Normal Power Mode chat flow
+            console.debug('Using normal Power Mode chat (no Word enhancement)', {
+                hasSelection: !!selectionText,
+                monitoringActive: monitoringActive,
+                selectionLength: selectionText.length
+            });
             const res = await fetch(POWER_CHAT_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     chat_id: selectedChatId.value,
-                    text: fullText + (inlineSelectionPreview ? `\n\n[Inline Selection Preview]:\n${inlineSelectionPreview}` : ''),
+                    text: fullText + (selectionText ? `\n\n[Inline Selection Preview]:\n${selectionText}` : ''),
                     doc_info: fileNames.length > 0 ? fileNames.join(', ') : undefined,
                     service: getServiceName(),
                     selected_tags: selectedTags.value && selectedTags.value.length > 0 ? selectedTags.value : undefined,
@@ -1616,7 +1833,7 @@ async function sendMessage() {
                 executeResult: serverExecResult || null
             };
             messages.value.push(aiMsg);
-            if (inlineSelectionPreview && !(serverExecResult && serverExecResult.inline_edit)) {
+            if (selectionText && !(serverExecResult && serverExecResult.inline_edit)) {
                 try { showAlertModal('LLM responded but did not modify the selected text. It may have failed to detect replacement markers.'); } catch { /* ignore */ }
             }
             // If server did not auto-execute (or returned nothing), execute client-side as a fallback
@@ -1830,7 +2047,7 @@ async function deleteChat(chatId) {
 
 watch(powerMode, (enabled) => {
     if (!enabled) {
-        clearInlineSelectionIndicator();
+        disableInlineSelection();
     }
 });
 
@@ -1839,10 +2056,14 @@ onMounted(async () => {
     themeState.setPower(!!powerMode.value);
     await loadChats();
     startNewChat();
+    
+    // Don't auto-start monitoring - user must click the green button
 });
 
 import { onUnmounted } from 'vue';
 onUnmounted(() => {
+    // Stop clipboard monitoring when component unmounts
+    stopClipboardMonitoring();
     // Leaving Research Assistant should restore the default app backdrop
     try { themeState.clear(); } catch { /* noop */ }
 });

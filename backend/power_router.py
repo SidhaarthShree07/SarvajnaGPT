@@ -32,6 +32,8 @@ try:
         select_snap_assist_tile,
         snap_current_and_select,
         trigger_snap,
+        capture_inline_selection,
+        capture_full_document_text_and_restore_selection,
         open_path as cua_open_path,
         open_path_background as cua_open_path_background,
         open_vscode as cua_open_vscode,
@@ -41,6 +43,7 @@ try:
         focus_window_by_tokens,
         wait_for_window_appearance,
         ensure_focus,
+        ensure_focus_top,
         get_focused_window_name,
         paste_text_to_foreground_app,
         paste_rich_text_to_foreground_app,
@@ -55,6 +58,8 @@ except Exception:  # pragma: no cover
             select_snap_assist_tile,
             snap_current_and_select,
             trigger_snap,
+            capture_inline_selection,
+            capture_full_document_text_and_restore_selection,
             open_path as cua_open_path,
             open_path_background as cua_open_path_background,
             open_vscode as cua_open_vscode,
@@ -64,6 +69,7 @@ except Exception:  # pragma: no cover
             focus_window_by_tokens,
             wait_for_window_appearance,
             ensure_focus,
+            ensure_focus_top,
             get_focused_window_name,
             paste_text_to_foreground_app,
             paste_rich_text_to_foreground_app,
@@ -527,12 +533,20 @@ def open_doc_intelligently(req: 'OpenDocIntelligentlyRequest') -> Dict[str, Any]
             is_word_like = is_word_like
             if (not is_code_like) and is_word_like:
                 side = 'left'
-                # Strict, ordered attempts to avoid VS Code: require browser name where possible
+                # Prefer selecting the SarvajñaGPT tab specifically on the RIGHT. Avoid generic browser-only fallbacks.
+                # Include common title variations and normalized forms to improve matching reliability.
                 attempt_sets: list[list[str]] = [
+                    ["sarvajnagpt", "microsoft edge"], ["sarvajna gpt", "microsoft edge"],
                     ["sarvajña", "microsoft edge"], ["sarvajna", "microsoft edge"],
+                    ["sarvajnagpt", "google chrome"], ["sarvajna gpt", "google chrome"],
                     ["sarvajña", "google chrome"], ["sarvajna", "google chrome"],
+                    ["sarvajnagpt", "mozilla firefox"], ["sarvajna gpt", "mozilla firefox"],
                     ["sarvajña", "mozilla firefox"], ["sarvajna", "mozilla firefox"],
+                    ["sarvajnagpt", "brave"], ["sarvajna gpt", "brave"],
                     ["sarvajña", "brave"], ["sarvajna", "brave"],
+                ]
+                # Fallback: generic browser-only tokens to at least complete the split
+                attempt_sets_generic: list[list[str]] = [
                     ["microsoft edge"], ["google chrome"], ["mozilla firefox"], ["brave"],
                 ]
                 import time as _tlim
@@ -553,24 +567,72 @@ def open_doc_intelligently(req: 'OpenDocIntelligentlyRequest') -> Dict[str, Any]
                                 break
                         except Exception:
                             break
+                # Diagnostics-guided retry: if a tile containing SarvajñaGPT was seen, target it explicitly
+                if not snap.get("selected") and isinstance(snap.get("diagnostics"), dict):
+                    try:
+                        diag = snap.get("diagnostics") or {}
+                        names = [str(n) for n in (diag.get("unique_names") or [])]
+                        sar_cands = [n for n in names if ("sarvajna" in n.lower()) or ("sarvajña" in n.lower()) or ("sarvajnagpt" in n.lower())]
+                        if sar_cands and callable(select_snap_assist_tile):
+                            for cand in sar_cands[:4]:  # try up to 4 distinct candidates
+                                try:
+                                    # Try exact-name only, then with browser brand hints
+                                    if bool(select_snap_assist_tile([cand])):
+                                        snap["selected"] = True; snap["tokens"] = [cand]
+                                        break
+                                    for brand in ("microsoft edge", "google chrome", "mozilla firefox", "brave"):
+                                        if bool(select_snap_assist_tile([cand, brand])):
+                                            snap["selected"] = True; snap["tokens"] = [cand, brand]
+                                            break
+                                    if snap.get("selected"):
+                                        break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+                # If still not selected, re-trigger once with generic tokens and allow brief follow-ups
+                if not snap.get("selected"):
+                    try:
+                        snap = snap_current_and_select(attempt_sets_generic[0], snap_side=side)  # type: ignore[misc]
+                    except Exception:
+                        pass
+                    if not snap.get("selected"):
+                        g_start = _tlim.time()
+                        for toks in attempt_sets_generic[1:]:
+                            if (_tlim.time() - g_start) > 2.0:
+                                break
+                            try:
+                                ok = bool(select_snap_assist_tile(toks)) if callable(select_snap_assist_tile) else False
+                                if ok:
+                                    snap["selected"] = True
+                                    snap["tokens"] = toks
+                                    break
+                            except Exception:
+                                break
             elif is_code_like and suffix != '.html':
                 side = 'left'
+                # Prefer SarvajñaGPT tab for right-side selection in double-split with VS Code
                 attempt_sets: list[list[str]] = [
+                    ["sarvajnagpt", "microsoft edge"], ["sarvajna gpt", "microsoft edge"],
                     ["sarvajña", "microsoft edge"], ["sarvajna", "microsoft edge"],
+                    ["sarvajnagpt", "google chrome"], ["sarvajna gpt", "google chrome"],
                     ["sarvajña", "google chrome"], ["sarvajna", "google chrome"],
+                    ["sarvajnagpt", "mozilla firefox"], ["sarvajna gpt", "mozilla firefox"],
                     ["sarvajña", "mozilla firefox"], ["sarvajna", "mozilla firefox"],
+                    ["sarvajnagpt", "brave"], ["sarvajna gpt", "brave"],
                     ["sarvajña", "brave"], ["sarvajna", "brave"],
-                    ["microsoft edge"], ["google chrome"], ["mozilla firefox"], ["brave"],
                 ]
+                # Fallback: generic browser tokens to ensure split completes if SarvajñaGPT not visible
+                attempt_sets_generic: list[list[str]] = [["microsoft edge"], ["google chrome"], ["mozilla firefox"], ["brave"]]
                 import time as _tlim
                 snap = {"attempted": True, "selected": False}
                 start = _tlim.time()
                 # Trigger snap once using the first tokens
                 snap = snap_current_and_select(attempt_sets[0], snap_side=side)  # type: ignore[misc]
                 if not snap.get("selected"):
-                    # Within the remaining 2s window, try alternative tokens WITHOUT re-triggering snap
+                    # Within the remaining window, try alternative tokens WITHOUT re-triggering snap
                     for toks in attempt_sets[1:]:
-                        if (_tlim.time() - start) > 2.0:
+                        if (_tlim.time() - start) > 2.2:
                             break
                         try:
                             ok = bool(select_snap_assist_tile(toks)) if callable(select_snap_assist_tile) else False
@@ -580,6 +642,47 @@ def open_doc_intelligently(req: 'OpenDocIntelligentlyRequest') -> Dict[str, Any]
                                 break
                         except Exception:
                             break
+                # Diagnostics-guided retry: explicitly target any visible SarvajñaGPT tiles
+                if not snap.get("selected") and isinstance(snap.get("diagnostics"), dict):
+                    try:
+                        diag = snap.get("diagnostics") or {}
+                        names = [str(n) for n in (diag.get("unique_names") or [])]
+                        sar_cands = [n for n in names if ("sarvajna" in n.lower()) or ("sarvajña" in n.lower()) or ("sarvajnagpt" in n.lower())]
+                        if sar_cands and callable(select_snap_assist_tile):
+                            for cand in sar_cands[:4]:
+                                try:
+                                    if bool(select_snap_assist_tile([cand])):
+                                        snap["selected"] = True; snap["tokens"] = [cand]
+                                        break
+                                    for brand in ("microsoft edge", "google chrome", "mozilla firefox", "brave"):
+                                        if bool(select_snap_assist_tile([cand, brand])):
+                                            snap["selected"] = True; snap["tokens"] = [cand, brand]
+                                            break
+                                    if snap.get("selected"):
+                                        break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+                # Final generic fallback: re-trigger and try generic brand tokens
+                if not snap.get("selected"):
+                    try:
+                        snap = snap_current_and_select(attempt_sets_generic[0], snap_side=side)  # type: ignore[misc]
+                    except Exception:
+                        pass
+                    if not snap.get("selected"):
+                        g_start = _tlim.time()
+                        for toks in attempt_sets_generic[1:]:
+                            if (_tlim.time() - g_start) > 2.0:
+                                break
+                            try:
+                                ok = bool(select_snap_assist_tile(toks)) if callable(select_snap_assist_tile) else False
+                                if ok:
+                                    snap["selected"] = True
+                                    snap["tokens"] = toks
+                                    break
+                            except Exception:
+                                break
             elif is_code_like and suffix == '.html':
                 # New generic, order-agnostic flow per user request:
                 # 1) Ensure browser+code windows exist, then perform right snap and select tiles without predetermined roles.
@@ -728,14 +831,18 @@ def open_doc_cua_only(req: OpenDocCUARequest) -> Dict[str, Any]:
             _t.sleep(0.08)
         except Exception:
             pass
-        # Snap Word LEFT and select SarvajñaGPT browser on RIGHT (avoid selecting VS Code)
+        # Snap Word LEFT and select SarvajñaGPT tab on RIGHT; fallback to generic browser-only tokens if needed
         attempt_sets: list[list[str]] = [
+            ["sarvajnagpt", "microsoft edge"], ["sarvajna gpt", "microsoft edge"],
             ["sarvajña", "microsoft edge"], ["sarvajna", "microsoft edge"],
+            ["sarvajnagpt", "google chrome"], ["sarvajna gpt", "google chrome"],
             ["sarvajña", "google chrome"], ["sarvajna", "google chrome"],
+            ["sarvajnagpt", "mozilla firefox"], ["sarvajna gpt", "mozilla firefox"],
             ["sarvajña", "mozilla firefox"], ["sarvajna", "mozilla firefox"],
+            ["sarvajnagpt", "brave"], ["sarvajna gpt", "brave"],
             ["sarvajña", "brave"], ["sarvajna", "brave"],
-            ["microsoft edge"], ["google chrome"], ["mozilla firefox"], ["brave"],
         ]
+        attempt_sets_generic: list[list[str]] = [["microsoft edge"], ["google chrome"], ["mozilla firefox"], ["brave"]]
         if callable(snap_current_and_select):  # type: ignore[truthy-bool]
             import time as _tlim
             snap = {"attempted": True, "selected": False}
@@ -755,6 +862,47 @@ def open_doc_cua_only(req: OpenDocCUARequest) -> Dict[str, Any]:
                             break
                     except Exception:
                         break
+            # Diagnostics-guided retry: if a tile containing SarvajñaGPT was seen, target it explicitly
+            if not snap.get("selected") and isinstance(snap.get("diagnostics"), dict):
+                try:
+                    diag = snap.get("diagnostics") or {}
+                    names = [str(n) for n in (diag.get("unique_names") or [])]
+                    sar_cands = [n for n in names if ("sarvajna" in n.lower()) or ("sarvajña" in n.lower()) or ("sarvajnagpt" in n.lower())]
+                    if sar_cands and callable(select_snap_assist_tile):
+                        for cand in sar_cands[:4]:
+                            try:
+                                if bool(select_snap_assist_tile([cand])):
+                                    snap["selected"] = True; snap["tokens"] = [cand]
+                                    break
+                                for brand in ("microsoft edge", "google chrome", "mozilla firefox", "brave"):
+                                    if bool(select_snap_assist_tile([cand, brand])):
+                                        snap["selected"] = True; snap["tokens"] = [cand, brand]
+                                        break
+                                if snap.get("selected"):
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+            # If still not selected, re-trigger once with generic browser tokens
+            if not snap.get("selected"):
+                try:
+                    snap = snap_current_and_select(attempt_sets_generic[0], snap_side='left')  # type: ignore[misc]
+                except Exception:
+                    pass
+                if not snap.get("selected"):
+                    g_start = _tlim.time()
+                    for toks in attempt_sets_generic[1:]:
+                        if (_tlim.time() - g_start) > 1.8:
+                            break
+                        try:
+                            ok = bool(select_snap_assist_tile(toks)) if callable(select_snap_assist_tile) else False
+                            if ok:
+                                snap["selected"] = True
+                                snap["tokens"] = toks
+                                break
+                        except Exception:
+                            break
         else:
             # Fallback single-shot using first attempt tokens
             snap = _select_tokens(attempt_sets[0])
@@ -945,6 +1093,264 @@ class PowerChatRequest(BaseModel):
     selected_tags: Optional[list[str]] = None
     mem_context: Optional[str] = None
     auto_execute: Optional[bool] = Field(False, description="If true, server may plan/execute actions and include results")
+
+
+# -------------------- Word inline enhance/replace endpoint --------------------
+class WordEnhanceSelectionRequest(BaseModel):
+    prompt: str = Field(..., description="Instruction for the LLM, e.g., 'explain in more detail'.")
+    selection_text: str = Field(..., description="The selected text to enhance (from frontend clipboard)")
+    chat_id: str | None = Field(None, description="Chat ID to lookup associated document path from chat_state")
+    # Optional tuning
+    max_full_context_chars: int | None = Field(60000, description="Cap full-document text for LLM context")
+    rich: bool | None = Field(True, description="Paste with basic rich text formatting from Markdown output")
+
+
+@router.post("/word/enhance_selection")
+def word_enhance_selection(req: WordEnhanceSelectionRequest) -> Dict[str, Any]:
+    """Enhance Word selection using provided text, send to LLM with full-document context, and replace selection.
+
+    Flow:
+    - Use selection text provided by frontend (already captured from clipboard)
+    - If chat_id provided, look up Word document path from chat_state database
+    - If doc_path found, read full document content directly from file
+    - Otherwise fall back to Ctrl+A/Ctrl+C method to capture from open Word window
+    - Call LLM with (prompt + selected + full context)
+    - Paste replacement back into Word, replacing the selection
+    Returns diagnostics and paste status.
+    """
+    import time as _t
+    
+    print("\n" + "="*80)
+    print("WORD ENHANCEMENT DEBUG - START")
+    print("="*80)
+    
+    # 1) Use the selection text provided by frontend
+    selected_preview = (req.selection_text or '').strip()
+    print(f"\n1. SELECTION TEXT RECEIVED:")
+    print(f"   Length: {len(selected_preview)}")
+    print(f"   Preview: {selected_preview[:200]}")
+    print(f"   Chat ID: {req.chat_id}")
+    print(f"   Prompt: {req.prompt}")
+    
+    if not selected_preview:
+        raise HTTPException(status_code=400, detail="no_selection_provided - selection_text is empty")
+    
+    # 2) Try to get full document from database if chat_id provided
+    full_text = ''
+    doc_source = 'none'
+    
+    print(f"\n2. DOCUMENT LOOKUP:")
+    if req.chat_id:
+        print(f"   Chat ID provided: {req.chat_id}")
+        # Look up document path from chat_state
+        DBP = os.path.join(os.path.dirname(__file__), 'chat_embeddings.db')
+        print(f"   Database path: {DBP}")
+        try:
+            conn = _sqlite3.connect(DBP)
+            try:
+                c = conn.cursor()
+                c.execute('''CREATE TABLE IF NOT EXISTS chat_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id TEXT,
+                    service TEXT,
+                    persistent_tags TEXT,
+                    doc_path TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER
+                )''')
+                # Look for doc_path in chat_state (service defaults to 'power_mode')
+                c.execute('SELECT doc_path FROM chat_state WHERE chat_id=? ORDER BY id DESC LIMIT 1', (req.chat_id,))
+                row = c.fetchone()
+                print(f"   Database query result: {row}")
+                if row and row[0]:
+                    doc_path = str(row[0])
+                    print(f"   Found doc_path: {doc_path}")
+                    print(f"   File exists: {os.path.isfile(doc_path)}")
+                    print(f"   Is Word file: {doc_path.lower().endswith(('.doc', '.docx'))}")
+                    # Check if it's a Word document
+                    if doc_path.lower().endswith(('.doc', '.docx')) and os.path.isfile(doc_path):
+                        # Read the Word document
+                        try:
+                            from docx import Document  # type: ignore
+                            doc = Document(doc_path)
+                            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                            full_text = '\n'.join(paragraphs)
+                            doc_source = f'database:{os.path.basename(doc_path)}'
+                            print(f"   Successfully read from file!")
+                            print(f"   Paragraphs found: {len(paragraphs)}")
+                            print(f"   Total chars: {len(full_text)}")
+                        except ImportError as e:
+                            print(f"   ERROR: python-docx not available: {e}")
+                            # python-docx not available, fall back to clipboard method
+                            pass
+                        except Exception as e:
+                            print(f"   ERROR reading file: {e}")
+                            # Error reading file, fall back to clipboard method
+                            pass
+                else:
+                    print(f"   No doc_path found in database")
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"   Database error: {e}")
+            pass
+    else:
+        print(f"   No chat_id provided, skipping database lookup")
+    
+    # 3) If no full text from database, use clipboard method (focus Word and capture)
+    restored = False
+    print(f"\n3. FULL DOCUMENT CAPTURE:")
+    print(f"   Doc source so far: {doc_source}")
+    print(f"   Full text length: {len(full_text)}")
+    
+    if not full_text:
+        print(f"   No text from database, using clipboard method...")
+        # Ensure Word is focused
+        focused = False
+        try:
+            if callable(focus_window_by_tokens):
+                focused = focus_window_by_tokens(["microsoft word", "word"])  # type: ignore[misc]
+                print(f"   focus_window_by_tokens result: {focused}")
+            if not focused and callable(ensure_focus):
+                focused = ensure_focus(["microsoft word", "word"])  # type: ignore[misc]
+                print(f"   ensure_focus result: {focused}")
+            _t.sleep(0.15)  # Let focus settle
+        except Exception as e:
+            print(f"   Focus error: {e}")
+            pass  # Continue anyway
+        
+        # Capture full-document text and restore selection
+        try:
+            if callable(capture_full_document_text_and_restore_selection):
+                print(f"   Calling capture_full_document_text_and_restore_selection...")
+                caps = capture_full_document_text_and_restore_selection(selected_preview, max_chars=(req.max_full_context_chars or 60000))  # type: ignore[misc]
+                print(f"   Capture result: {caps}")
+                if isinstance(caps, dict):
+                    full_text = str(caps.get('text') or '')
+                    restored = bool(caps.get('restored'))
+                    doc_source = 'clipboard'
+                    print(f"   Clipboard capture successful!")
+                    print(f"   Full text length: {len(full_text)}")
+                    print(f"   Selection restored: {restored}")
+        except Exception as e:
+            print(f"   Clipboard capture error: {e}")
+            full_text = ''
+            restored = False
+    else:
+        print(f"   Using text from database, skipping clipboard capture")
+    
+    # 4) Build LLM prompt with clear instructions
+    user_prompt = (req.prompt or '').strip()
+    if not user_prompt:
+        user_prompt = 'Rewrite in more detail while preserving meaning and style.'
+    
+    # Keep context manageable
+    max_ctx = max(10000, int(req.max_full_context_chars or 60000))
+    ctx = (full_text or '')
+    if len(ctx) > max_ctx:
+        ctx = ctx[:max_ctx]
+    
+    print(f"\n4. LLM PROMPT CONSTRUCTION:")
+    print(f"   User prompt: {user_prompt}")
+    print(f"   Context length (before truncation): {len(full_text)}")
+    print(f"   Context length (after truncation): {len(ctx)}")
+    print(f"   Max context allowed: {max_ctx}")
+    
+    # Enhanced LLM prompt - Just enhance the selected text
+    llm_input = f"""You are a text enhancement assistant. Your ONLY job is to improve the selected text based on the user's request.
+
+CRITICAL RULES:
+- Return ONLY the improved text, nothing else
+- NO explanations, NO thinking process, NO commentary
+- NO markers like "Here is..." or "ENHANCED TEXT:"
+- Just the improved text that will replace the selection
+
+USER REQUEST: {user_prompt}
+
+SELECTED TEXT TO ENHANCE:
+{selected_preview}
+
+FULL DOCUMENT CONTEXT (for reference only):
+{ctx}
+
+Now return ONLY the enhanced version of the selected text:"""
+    
+    print(f"\n   FULL LLM INPUT:")
+    print("   " + "-"*76)
+    print("   " + llm_input.replace("\n", "\n   "))
+    print("   " + "-"*76)
+    
+    # 5) Call LLM
+    print(f"\n5. CALLING LLM...")
+    try:
+        out_text = _power_llm(llm_input) if callable(_power_llm) else ''  # type: ignore[misc]
+        print(f"   LLM Response received!")
+        print(f"   Response length: {len(out_text)}")
+        print(f"   Response preview (first 500 chars):")
+        print("   " + "-"*76)
+        print("   " + out_text[:500].replace("\n", "\n   "))
+        print("   " + "-"*76)
+        
+        # Clean up LLM response - remove <think> tags and extra commentary
+        import re
+        # Remove <think>...</think> blocks
+        out_text = re.sub(r'<think>.*?</think>', '', out_text, flags=re.DOTALL | re.IGNORECASE)
+        # Remove common prefixes
+        out_text = re.sub(r'^(Here is|Here\'s|Enhanced text:|ENHANCED TEXT:)\s*', '', out_text, flags=re.IGNORECASE | re.MULTILINE)
+        # Remove markdown code blocks if present
+        out_text = re.sub(r'^```.*?\n', '', out_text, flags=re.MULTILINE)
+        out_text = re.sub(r'\n```$', '', out_text)
+        out_text = out_text.strip()
+        
+        print(f"   After cleanup:")
+        print(f"   Cleaned length: {len(out_text)}")
+        print(f"   Cleaned preview (first 500 chars):")
+        print("   " + "-"*76)
+        print("   " + out_text[:500].replace("\n", "\n   "))
+        print("   " + "-"*76)
+        
+    except Exception as e:
+        print(f"   LLM ERROR: {e}")
+        raise HTTPException(status_code=500, detail=f"llm_failed:{e}")
+    
+    out_text = (out_text or '').strip()
+    if not out_text:
+        print(f"   ERROR: LLM returned empty output!")
+        raise HTTPException(status_code=500, detail="llm_empty_output")
+    
+    print(f"   LLM output ready for pasting")
+    
+    # 6) Copy the enhanced text to clipboard for manual pasting
+    print(f"\n6. COPYING TO CLIPBOARD:")
+    try:
+        import pyperclip  # type: ignore
+        pyperclip.copy(out_text)
+        print(f"   ✓ Enhanced text copied to clipboard ({len(out_text)} chars)")
+        clipboard_copied = True
+    except Exception as e:
+        print(f"   ✗ Failed to copy to clipboard: {e}")
+        clipboard_copied = False
+    
+    result = {
+        'ok': True,
+        'selection': {'length': len(selected_preview), 'preview': selected_preview[:240]},
+        'context_used': len(ctx),
+        'full_doc_length': len(full_text),
+        'doc_source': doc_source,
+        'restored_before_replace': bool(restored),
+        'clipboard_copied': clipboard_copied,
+        'llm_output_length': len(out_text),
+        'enhanced_text_preview': out_text[:500],  # Preview for debugging
+        'instructions': 'Select the text in Word → Press Ctrl+V to replace with enhanced version',
+    }
+    
+    print(f"\n7. FINAL RESULT:")
+    print(f"   {result}")
+    print("\n" + "="*80)
+    print("WORD ENHANCEMENT DEBUG - END")
+    print("="*80 + "\n")
+    
+    return result
 
 
 # Lightweight LLM + hashtag router for power chat
