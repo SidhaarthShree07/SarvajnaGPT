@@ -291,7 +291,7 @@ def _maybe_handle_inline_selection(req: 'PowerChatRequest', context_block: Optio
 # ---------------- VS Code Auto-Detection Utilities -----------------
 _VSCODE_DETECTION_CACHE: dict[str, str] = {}
 
-def _open_vscode_path(abs_path: str, side: str = 'right', split: bool = True) -> dict:
+def _open_vscode_path(abs_path: str, side: str = 'right', split: bool = True, new_window: bool = True) -> dict:
     """Internal helper to launch VS Code for a given absolute path and optionally snap window.
     Mirrors logic from automation.open_vscode action so we can auto-open after file creation.
     """
@@ -328,15 +328,19 @@ def _open_vscode_path(abs_path: str, side: str = 'right', split: bool = True) ->
             
             # Handle different launch methods based on installation type
             if resolved_cmd == "code" or use_shell:
-                # For Microsoft Store installations or PATH-based installations,
-                # we need to use shell=True and properly quote the path
-                # Add the --new-window parameter to ensure it opens in a new window for proper split screen
-                cmd = f'code --new-window "{abs_path_real}"'
+                # Build command; optionally omit --new-window to reuse existing window
+                if new_window:
+                    cmd = f'code --new-window "{abs_path_real}"'
+                else:
+                    cmd = f'code "{abs_path_real}"'
                 print(f"VSCODE_OPEN: Running shell command: {cmd}")
                 _sub.Popen(cmd, shell=True)
             else:
-                # For direct executable paths - add --new-window for proper split screen
-                _sub.Popen([resolved_cmd, "--new-window", abs_path_real])
+                # For direct executable paths - add --new-window only when requested
+                if new_window:
+                    _sub.Popen([resolved_cmd, "--new-window", abs_path_real])
+                else:
+                    _sub.Popen([resolved_cmd, abs_path_real])
                 
             result["opened"] = True
             print("VSCODE_OPEN: Successfully launched VS Code")
@@ -893,6 +897,10 @@ def _planner_prompt(user_text: str, mem_context: Optional[str] = None) -> str:
         "- When creating Word documents include FULL prose content in the 'text' parameter (no placeholders). Honor requested word counts (generate that many words).\n"
         "- If user asks for an academic paper, include introduction, structured sections, conclusion, and references.\n"
         "- Never emit placeholder tokens like [1000 words] — always expand to real content.\n"
+        "- When creating CODE files with fs.write_file: put ONLY the raw code (no explanations) inside a single <code lang=EXT>...</code> block in the 'content' field. EXT must be an appropriate extension (py, js, ts, html, css, json, md).\n"
+        "- Do NOT include that code block inside assistant_text. assistant_text should be a concise summary or next-step guidance WITHOUT the full code.\n"
+        "- Do NOT wrap the entire JSON in markdown fences. Return strict JSON only.\n"
+        "- If multiple code files are needed, create one fs.write_file action per file, each with its own <code> block.\n"
     )
     tool_lines = "\n".join([f"- {k}: {v['description']} params={v['params']}" for k, v in TOOL_SPEC.items()])
     return (
@@ -900,7 +908,9 @@ def _planner_prompt(user_text: str, mem_context: Optional[str] = None) -> str:
         "Tools (functions) you can propose as actions:\n" + tool_lines + "\n\n"
         + policy + ctx +
         "\nOutput format:\n"
-        "Return ONLY strict JSON: {\"assistant_text\": string, \"actions\": [{\"type\": string, \"params\": object}]}. Do not include markdown code fences.\n\n"
+    "Return ONLY strict JSON: {\"assistant_text\": string, \"actions\": [{\"type\": string, \"params\": object}]}. Do not include markdown code fences.\n"
+    "If any fs.write_file action is used its 'content' MUST contain exactly one <code lang=EXT>...</code> block and nothing else (no preceding or trailing prose).\n"
+    "assistant_text MUST NOT repeat or inline the full code; keep it high-level.\n\n"
         "For word.open_and_type actions, ensure the params include:\n"
         "- \"text\": The complete text content to write to the document\n"
         "- \"save_target\": The location to save (\"desktop\", \"documents\", or \"downloads\")\n"
@@ -1818,6 +1828,11 @@ def power_execute(req: ExecuteActionsRequest) -> dict:
         print(f"POWER_EXEC_START: actions={len(getattr(req,'actions',[]) or [])} chat_id={getattr(req,'chat_id',None)}")
     except Exception:
         pass
+    # Pre-scan to know if planner already intends to open VS Code (to avoid duplicate auto open)
+    try:
+        planned_open_vscode = any(_normalize_action_type(x.type)=='automation.open_vscode' for x in (getattr(req,'actions',[]) or []))
+    except Exception:
+        planned_open_vscode = False
     for a in req.actions:
         atype = _normalize_action_type(a.type)
         try:
@@ -1836,157 +1851,96 @@ def power_execute(req: ExecuteActionsRequest) -> dict:
             res = fs_execute([action])
             results.append({"type": atype, "preview": prev, "result": res})
         elif atype == 'fs.write_file':
-            # Approach revision: agent_router enforces writes under agent_output. We first write there,
-            # then relocate (move) to Documents/SarvajnaGPT/web/index.html when it's a default heuristic path.
-            rel_candidate = params.get("relative_path") or params.get("absolute_path") or ''
-            lowered = rel_candidate.lower()
-            heuristic_default = (not rel_candidate) or lowered in ('files/index.html', 'files/output.html', 'files/generated.txt')
-            # Always write to a sandbox relative path first (stable)
-            write_rel = 'files/index.html' if heuristic_default else rel_candidate
-            if not write_rel:
-                write_rel = 'files/index.html'
-            safe_rel = _to_safe_rel_path(write_rel, default_dir='files', default_filename='index.html')
-            # Ensure relative for agent write (avoid absolute to pass allowlist)
-            if os.path.isabs(safe_rel):
-                # reduce to basename under files/
-                safe_rel = f"files/{os.path.basename(safe_rel)}"
-            action = FsAction(type=FsActionType.FS_WRITE_FILE, params={
-                "relative_path": safe_rel,
-                "absolute_path": None,
-                "content": params.get("content", ""),
-                "encoding": params.get("encoding", "utf-8"),
-            })
-            prev = fs_preview(action)
-            res = fs_execute([action])
-            results.append({"type": atype, "preview": prev, "result": res})
-            # Persist code file path to chat_state doc_path (reuse column) for automatic reopen
+            # Direct-to-Documents strategy (removes sandbox write):
+            rel_candidate = params.get('relative_path') or params.get('absolute_path') or ''
+            raw_content = params.get('content', '') or ''
+            # Extract raw code from a single <code lang="py">...</code> (quotes around lang optional)
+            code_match = re.search(r"<code\s+lang=[\"']?([a-zA-Z0-9_.-]+)[\"']?>([\s\S]*?)</code>", raw_content)
+            extracted_lang = None
+            if code_match:
+                extracted_lang = code_match.group(1).strip('.').lower()
+                raw_content = code_match.group(2).replace('\r\n','\n')
+            # Determine extension & target folder
+            ext_map = {'py':'.py','python':'.py','js':'.js','ts':'.ts','html':'.html','htm':'.html','css':'.css','json':'.json','md':'.md','txt':'.txt'}
+            inferred_ext = ext_map.get(extracted_lang or '', None)
+            # Build filename if missing
+            base_name = os.path.splitext(os.path.basename(rel_candidate))[0] if rel_candidate else 'generated'
+            if not base_name:
+                base_name = 'generated'
+            existing_ext = os.path.splitext(rel_candidate)[1] if rel_candidate else ''
+            if not existing_ext:
+                if inferred_ext:
+                    filename = base_name + inferred_ext
+                else:
+                    filename = base_name + '.py'
+            else:
+                filename = base_name + existing_ext
+            # Decide subfolder (web for html, code for others)
             try:
-                if getattr(req, 'chat_id', None) and isinstance(res, list) and res:
-                    first = res[0]
-                    abs_path = (first.get('result') or {}).get('path') if isinstance(first, dict) else None
-                    if abs_path and os.path.isfile(abs_path):
-                        final_abs_path = abs_path
-                        moved = False
-                        if heuristic_default:
-                            try:
-                                docs = _get_standard_user_folder('documents')
-                                target_root = os.path.abspath(os.path.join(str(docs), 'SarvajnaGPT', 'web'))
-                                os.makedirs(target_root, exist_ok=True)
-                                dest = os.path.abspath(os.path.join(target_root, 'index.html'))
-                                # Move/overwrite
-                                shutil.copy2(abs_path, dest)
-                                final_abs_path = dest
-                                moved = True
-                                # Delete sandbox copy to ensure only one file exists
-                                try:
-                                    os.remove(abs_path)
-                                    print(f"POWER_EXEC_DELETED_SANDBOX: {abs_path}")
-                                except Exception as _e_del:
-                                    print(f"POWER_EXEC_DELETE_ERR: {_e_del}")
-                            except Exception as _e_move:
-                                try:
-                                    print(f"POWER_EXEC_MOVE_DEFAULT_ERR: {_e_move}")
-                                except Exception:
-                                    pass
-                        else:
-                            # Promotion rule for code files: move sandbox-created code under Documents/SarvajnaGPT/code/
-                            try:
-                                ext = os.path.splitext(abs_path)[1].lower()
-                                promotable_exts = {'.py', '.js', '.ts', '.css', '.html', '.htm', '.md', '.txt'}
-                                if ext in promotable_exts and os.path.isfile(abs_path):
-                                    docs = _get_standard_user_folder('documents')
-                                    code_root = os.path.abspath(os.path.join(str(docs), 'SarvajnaGPT', 'code'))
-                                    os.makedirs(code_root, exist_ok=True)
-                                    rel_under_agent = None
-                                    try:
-                                        rel_under_agent = os.path.relpath(abs_path, AGENT_BASE_DIR)
-                                    except Exception:
-                                        rel_under_agent = os.path.basename(abs_path)
-                                    safe_rel_parts = [seg for seg in rel_under_agent.replace('\\','/').split('/') if seg not in ('', '.', '..')]
-                                    # Recreate relative structure under code_root
-                                    dest_path = os.path.abspath(os.path.join(code_root, *safe_rel_parts))
-                                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                                    # If destination exists, add unique suffix
-                                    if os.path.exists(dest_path):
-                                        base_name, base_ext = os.path.splitext(dest_path)
-                                        dest_path = f"{base_name}_{uuid.uuid4().hex[:6]}{base_ext}"
-                                    shutil.move(abs_path, dest_path)
-                                    final_abs_path = dest_path
-                                    moved = True
-                                    print(f"POWER_EXEC_PROMOTE_CODE: {abs_path} -> {dest_path}")
-                                    # If planner did not specify an explicit open_vscode for this file, auto-open now.
-                                    # Determine if an open_vscode action already queued in local results context (conservative False if unknown)
-                                    already_requested_open = any(r.get('type') == 'automation.open_vscode' for r in results)
-                                    if not already_requested_open:
-                                        try:
-                                            vs_res = _open_vscode_path(final_abs_path, side='right', split=True)
-                                            results.append({"type": 'automation.open_vscode', "auto": True, "result": vs_res})
-                                            print(f"POWER_EXEC_AUTO_OPEN_VSCODE: {final_abs_path}")
-                                        except Exception as _e_autoov:
-                                            print(f"POWER_EXEC_AUTO_OPEN_VSCODE_ERR: {_e_autoov}")
-                            except Exception as _e_prom:
-                                try:
-                                    print(f"POWER_EXEC_PROMOTE_CODE_ERR: {_e_prom}")
-                                except Exception:
-                                    pass
-                        ext = os.path.splitext(abs_path)[1].lower()
-                        if ext in ('.html', '.htm', '.js', '.css', '.py', '.md', '.txt'):
-                            _chat_state_upsert(getattr(req,'chat_id'), getattr(req,'service',None), None, final_abs_path)
-                            # Also update latest chat row doc_info with this path
-                            try:
-                                conn_u = sqlite3.connect(DB_PATH)
-                                cu = conn_u.cursor()
-                                cu.execute('SELECT id FROM chat WHERE chat_id=? ORDER BY id DESC LIMIT 1', (getattr(req,'chat_id'),))
-                                row = cu.fetchone()
-                                if row:
-                                    cu.execute('UPDATE chat SET doc_info=? WHERE id=?', (final_abs_path, row[0]))
-                                    conn_u.commit()
-                                conn_u.close()
-                            except Exception as _e_upd:
-                                try:
-                                    print(f"POWER_EXEC_DOC_INFO_UPDATE_ERR: {_e_upd}")
-                                except Exception:
-                                    pass
-                            try:
-                                print(f"POWER_EXEC_PERSIST_CODE_PATH: {final_abs_path} (moved={moved})")
-                            except Exception:
-                                pass
-                            if moved:
-                                try:
-                                    print(f"POWER_EXEC_LAUNCHING_VSCODE: path={final_abs_path}")
-                                    vs_res = _open_vscode_path(final_abs_path, side='right', split=True)
-                                    results.append({"type": 'automation.open_vscode', "result": vs_res})
-                                except Exception as _e_vs:
-                                    print(f"POWER_EXEC_VSCODE_ERR: {_e_vs}")
-                                    pass
-            except Exception as _epers:
+                docs = _get_standard_user_folder('documents')
+            except Exception:
+                docs = Path.home() / 'Documents'
+            sub_root = 'web' if filename.lower().endswith(('.html','.htm')) else 'code'
+            # Rebuild any provided relative subdirectories (except path traversal tokens)
+            rel_dirs = []
+            if rel_candidate:
+                parts = [p for p in rel_candidate.replace('\\','/').split('/')[:-1] if p and p not in ('.','..')]
+                rel_dirs = parts
+            target_dir = os.path.abspath(os.path.join(str(docs), 'SarvajnaGPT', sub_root, *rel_dirs))
+            os.makedirs(target_dir, exist_ok=True)
+            dest_path = os.path.abspath(os.path.join(target_dir, filename))
+            try:
+                with open(dest_path, 'w', encoding=params.get('encoding','utf-8')) as f:
+                    f.write(raw_content)
+                print(f"POWER_EXEC_WRITE_DOCS: {dest_path}")
+            except Exception as _e_write:
+                results.append({"type": atype, "error": True, "detail": f"WRITE_FAIL: {_e_write}"})
+                continue
+            # Persist chat state
+            try:
+                if getattr(req,'chat_id',None):
+                    _chat_state_upsert(req.chat_id, getattr(req,'service',None), None, dest_path)
+                    try:
+                        conn_u = sqlite3.connect(DB_PATH)
+                        cu = conn_u.cursor()
+                        cu.execute('SELECT id FROM chat WHERE chat_id=? ORDER BY id DESC LIMIT 1', (req.chat_id,))
+                        row = cu.fetchone()
+                        if row:
+                            cu.execute('UPDATE chat SET doc_info=? WHERE id=?', (dest_path, row[0]))
+                            conn_u.commit()
+                        conn_u.close()
+                    except Exception as _e_db:
+                        print(f"POWER_EXEC_WRITE_DOCS_DB_ERR: {_e_db}")
+            except Exception as _e_state:
+                print(f"POWER_EXEC_WRITE_DOCS_STATE_ERR: {_e_state}")
+            results.append({"type": atype, "path": dest_path, "error": False})
+            # Auto open VS Code if planner didn\'t request it
+            if not planned_open_vscode:
                 try:
-                    print(f"POWER_EXEC_PERSIST_CODE_ERR: {_epers}")
-                except Exception:
-                    pass
+                    vs_res = _open_vscode_path(dest_path, side='right', split=True)
+                    results.append({"type": 'automation.open_vscode', "auto": True, "result": vs_res})
+                    print(f"POWER_EXEC_AUTO_VSCODE_DOCS: {dest_path}")
+                except Exception as _e_vsc:
+                    print(f"POWER_EXEC_AUTO_VSCODE_DOCS_ERR: {_e_vsc}")
+            continue
         elif atype == 'automation.open_vscode':
+            # Reworked to delegate to automation_router for CUA-enabled snapping & tab focusing
             try:
-                import subprocess as _sub
                 path_param = params.get('path') or 'files'
-                print(f"VSCODE_DEBUG: Initial path_param={path_param}")
-                
-                # CRITICAL FIX: If tagged with __default_site__ true (from post-rewrite), force Documents path
+                print(f"VSCODE_CUA: Initial path_param={path_param}")
+
+                # If tagged default site ensure absolute Documents web path (retain prior behavior)
                 if params.get('__default_site__'):
                     try:
                         docs_base = _get_standard_user_folder('documents')
-                        # Get filename from path_param or use default
                         filename = os.path.basename(path_param) if os.path.basename(path_param) else 'index.html'
                         docs_path = os.path.abspath(os.path.join(str(docs_base), 'SarvajnaGPT', 'web', filename))
-                        # Ensure directory exists
                         os.makedirs(os.path.dirname(docs_path), exist_ok=True)
-                        print(f"VSCODE_DEBUG: Force default site path: {docs_path}")
                         path_param = docs_path
-                        
-                        # Update chat_state and chat DB with this absolute path
+                        print(f"VSCODE_CUA: Forced web docs path -> {docs_path}")
                         if getattr(req, 'chat_id', None):
                             try:
                                 _chat_state_upsert(req.chat_id, getattr(req, 'service', None), None, docs_path)
-                                # Also update doc_info in latest chat row
                                 conn_u = sqlite3.connect(DB_PATH)
                                 cu = conn_u.cursor()
                                 cu.execute('SELECT id FROM chat WHERE chat_id=? ORDER BY id DESC LIMIT 1', (req.chat_id,))
@@ -1995,121 +1949,99 @@ def power_execute(req: ExecuteActionsRequest) -> dict:
                                     cu.execute('UPDATE chat SET doc_info=? WHERE id=?', (docs_path, row[0]))
                                     conn_u.commit()
                                 conn_u.close()
-                                print(f"VSCODE_DEBUG: Updated doc_info in DB: {docs_path}")
                             except Exception as _db_err:
-                                print(f"VSCODE_DEBUG: Failed to update DB: {_db_err}")
+                                print(f"VSCODE_CUA: doc_info update failed: {_db_err}")
                     except Exception as _e_docs:
-                        print(f"VSCODE_DEBUG: Failed to set docs path: {_e_docs}")
-                
-                # If we already persisted a doc_path for this chat and planner gave sandbox path, override.
+                        print(f"VSCODE_CUA: docs path set error: {_e_docs}")
+
+                # Prefer previously persisted absolute doc_path when relative placeholder provided
                 try:
-                    if getattr(req,'chat_id',None) and not params.get('__default_site__'):
+                    if getattr(req,'chat_id',None) and not os.path.isabs(path_param) and not params.get('__default_site__'):
                         st = _chat_state_get(getattr(req,'chat_id'), getattr(req,'service',None))
                         existing_doc = (st or {}).get('doc_path')
-                        print(f"VSCODE_DEBUG: Found doc_path={existing_doc}")
-                        if existing_doc and os.path.isfile(existing_doc) and ('files/' in path_param.lower() or path_param.lower().endswith(os.path.basename(existing_doc).lower())):
+                        if existing_doc and os.path.isfile(existing_doc):
                             path_param = existing_doc
-                            print(f"VSCODE_DEBUG: Using existing doc_path: {path_param}")
+                            print(f"VSCODE_CUA: Using persisted doc_path {existing_doc}")
                 except Exception as _e_st:
-                    print(f"VSCODE_DEBUG: Failed to check chat_state: {_e_st}")
-                    
-                # Only apply safe_rel if not already absolute
+                    print(f"VSCODE_CUA: chat_state lookup error: {_e_st}")
+
+                # Resolve to absolute path (allow creation for not yet existing file)
                 if not os.path.isabs(path_param):
                     safe_rel = _to_safe_rel_path(path_param, default_dir='files', default_filename=None)
                     abs_path = os.path.join(AGENT_BASE_DIR, safe_rel)
-                    print(f"VSCODE_DEBUG: Transformed relative path: {path_param} -> {abs_path}")
+                    print(f"VSCODE_CUA: Relative -> {abs_path}")
                 else:
                     abs_path = path_param
-                    print(f"VSCODE_DEBUG: Using absolute path directly: {abs_path}")
-                if not os.path.exists(abs_path):
+                    print(f"VSCODE_CUA: Absolute path detected {abs_path}")
+                # Ensure directory exists so VS Code can create new file
+                try:
+                    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+                except Exception:
+                    pass
+
+                # Build request payload for automation_router
+                code_side = params.get('vscode_side') or 'right'
+                split_screen = params.get('split_screen', True)
+                # Override an explicit False from planner to maintain consistent UX (always split for first opens)
+                if split_screen is False:
                     try:
-                        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+                        print("VSCODE_CUA: Overriding split_screen=False -> True for consistency")
                     except Exception:
                         pass
-                resolved_cmd, tried = _resolve_vscode_executable()
-                launched = False
-                err = None
-                snapped = False
-                side = params.get('vscode_side') or ('right' if params.get('split_screen') else None)
-                if resolved_cmd:
-                    use_shell = False
-                    if os.name == 'nt' and resolved_cmd.lower().endswith(('.cmd', '.bat')):
-                        use_shell = True
+                    split_screen = True
+                http_payload = {
+                    'abs_path': abs_path,
+                    'split_screen': bool(split_screen),
+                    'code_side': code_side,
+                    'use_os_snap_keys': True,
+                    'use_cua_for_selection': True,
+                    'arrangement_delay_ms': 1000,
+                }
+                http_mode = True  # always attempt HTTP first (mirrors word logic simplification)
+                result_obj = None
+                transport_used = None
+                if http_mode:
                     try:
-                        _sub.Popen([resolved_cmd, abs_path], shell=use_shell)
-                        launched = True
-                    except Exception as _el:
-                        err = f"Launch failed: {_el}"
-                    # Attempt split screen snap on Windows after small delay
-                    if launched and os.name == 'nt' and params.get('split_screen'):
-                        try:
-                            import time as _t, ctypes, os as _os
-                            _t.sleep(1.5)  # slightly longer for reliability
-                            user32 = ctypes.windll.user32
-                            user32.EnumWindows.restype = ctypes.c_bool
-                            user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p), ctypes.c_void_p]
-                            titles = []
-                            target_hwnd = None
-                            file_basename = os.path.basename(abs_path).lower()
-                            def _enum_proc(hwnd, lParam):  # type: ignore
-                                buff = ctypes.create_unicode_buffer(512)
-                                if user32.IsWindowVisible(hwnd):
-                                    user32.GetWindowTextW(hwnd, buff, 512)
-                                    title = buff.value
-                                    lowt = (title or '').lower()
-                                    if title and ('visual studio code' in lowt or file_basename in lowt):
-                                        titles.append(title)
-                                        nonlocal target_hwnd
-                                        target_hwnd = hwnd
-                                return True
-                            CMPFUNC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-                            # Retry enumeration multiple times for reliability
-                            attempts = 0
-                            while attempts < 3 and not target_hwnd:
-                                if attempts > 0:
-                                    _t.sleep(0.7)
-                                user32.EnumWindows(CMPFUNC(_enum_proc), 0)
-                                attempts += 1
-                            if target_hwnd:
-                                # Get screen dimensions
-                                sw = user32.GetSystemMetrics(0)
-                                sh = user32.GetSystemMetrics(1)
-                                half_w = int(sw/2)
-                                if side == 'left':
-                                    x, y, w, h = 0, 0, half_w, sh
-                                else:
-                                    x, y, w, h = half_w, 0, half_w, sh
-                                user32.MoveWindow(target_hwnd, x, y, w, h, True)
-                                snapped = True
-                        except Exception:
-                            pass
-                        # Fallback: simulate Win+Arrow if not snapped
-                        if launched and os.name == 'nt' and params.get('split_screen') and not snapped:
-                            try:
-                                import ctypes
-                                user32 = ctypes.windll.user32
-                                # Key codes
-                                VK_LEFT = 0x25
-                                VK_RIGHT = 0x27
-                                KEYEVENTF_EXTENDEDKEY = 0x0001
-                                KEYEVENTF_KEYUP = 0x0002
-                                VK_LWIN = 0x5B
-                                def key_down(vk):
-                                    user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
-                                def key_up(vk):
-                                    user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
-                                key_down(VK_LWIN)
-                                key_down(VK_LEFT if side == 'left' else VK_RIGHT)
-                                key_up(VK_LEFT if side == 'left' else VK_RIGHT)
-                                key_up(VK_LWIN)
-                                snapped = True  # assume success; we can't easily verify
-                            except Exception:
-                                pass
+                        import requests  # type: ignore
+                        base_url = os.environ.get('API_BASE_URL') or 'http://localhost:8000'
+                        endpoint = base_url.rstrip('/') + '/api/automation/vscode/open_existing'
+                        print(f"VSCODE_CUA_HTTP: POST {endpoint} path={abs_path}")
+                        resp = requests.post(endpoint, json=http_payload, timeout=40)
+                        if resp.ok:
+                            result_obj = resp.json()
+                            transport_used = 'http'
+                        else:
+                            print(f"VSCODE_CUA_HTTP_ERR: {resp.status_code} {resp.text[:180]}")
+                    except Exception as _http_e:
+                        print(f"VSCODE_CUA_HTTP_EXC: {_http_e}")
+
+                # In-process fallback if HTTP failed or returned error
+                if not isinstance(result_obj, dict) or not result_obj.get('opened', True):
+                    try:
+                        from automation_router import VSCodeOpenRequest, vscode_open_existing  # type: ignore
+                        req_obj = VSCodeOpenRequest(**http_payload)
+                        print("VSCODE_CUA_INPROC: calling vscode_open_existing fallback")
+                        result_obj = vscode_open_existing(req_obj)
+                        transport_used = (transport_used or '') + ('+inproc' if transport_used else 'inproc')
+                    except Exception as _inproc_e:
+                        print(f"VSCODE_CUA_INPROC_ERR: {_inproc_e}")
+                        result_obj = {'error': f'inproc_failed: {_inproc_e}'}
+
+                if isinstance(result_obj, dict):
+                    result_obj['transport'] = transport_used
                 else:
-                    err = "VS Code executable not found automatically. User may set POWER_VSCODE_BIN."
-                results.append({"type": atype, "result": {"opened": launched, "path": abs_path, "command": resolved_cmd, "error": err, "tried": tried, "snapped": snapped, "side": side}})
+                    result_obj = {'error': 'unexpected_result_type'}
+
+                # Persist doc_path if successfully opened
+                if result_obj.get('opened') and getattr(req,'chat_id',None):
+                    try:
+                        _chat_state_upsert(req.chat_id, getattr(req,'service',None), None, abs_path)
+                    except Exception:
+                        pass
+
+                results.append({'type': atype, 'result': result_obj})
             except Exception as _e_vs:
-                results.append({"type": atype, "error": f"VSCode open exception: {_e_vs}"})
+                results.append({'type': atype, 'error': f'VSCode CUA delegation exception: {_e_vs}'})
         elif atype == 'fs.mirror_to_documents':
             # Mirror a file or directory from agent_output into Documents/SarvajnaGPT
             try:

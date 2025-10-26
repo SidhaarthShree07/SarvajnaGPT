@@ -2436,7 +2436,8 @@ def vscode_open_existing(req: VSCodeOpenRequest) -> dict:
         result = _open_vscode_path(
             abs_path=abs_path_real,
             side=code_side_effective,
-            split=False  # We'll handle split screen ourselves for better control
+            split=False,  # We'll handle split screen ourselves for better control
+            new_window=False  # Reuse existing VS Code window to avoid duplicate windows
         )
         
         if not result.get("opened"):

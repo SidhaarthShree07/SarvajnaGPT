@@ -1,5 +1,5 @@
 <template>
-    <div id="BeginnerTeacher" class="font-sans flex justify-center items-center w-full" style="margin-top: 20px;">
+    <div id="BeginnerTeacher" class="font-sans flex justify-center items-start w-full" style="margin-top: 20px;">
         <div
             class="flex flex-col md:flex-row mx-auto mt-1 w-full max-w-7xl h-[calc(100vh-140px)] md:h-[calc(100vh-150px)] min-h-[500px] md:min-h-[600px] glass-bg border border-white/30 shadow-2xl rounded-3xl">
             <!-- Sidebar for chat history -->
@@ -49,7 +49,7 @@
             <transition name="fade">
                 <div v-if="isMobileSidebarOpen" class="md:hidden fixed inset-0 z-40 flex">
                     <div class="flex-1 bg-black/30" @click="isMobileSidebarOpen=false"></div>
-                    <div class="w-72 max-w-[85vw] h-full bg-white/90 backdrop-blur-md border-l border-orange-200/30 shadow-2xl p-4 flex flex-col">
+                    <div class="w-72 max-w-[85vw] h-full bg-white/90 backdrop-blur-md border-l border-orange-200/30 shadow-2xl p-4 flex flex-col min-h-0">
                         <div class="flex items-center justify-between mb-4">
                             <h2 class="text-base font-bold text-gray-800 flex items-center gap-2">
                                 <span class="material-symbols-outlined text-orange-400">lists</span>
@@ -60,7 +60,7 @@
                                 <span>New</span>
                             </button>
                         </div>
-                        <div class="flex-1 overflow-y-auto pt-2 hide-scrollbar min-h-0">
+                        <div class="flex-1 overflow-y-auto pt-2 mobile-scrollbar min-h-0 h-full">
                             <div v-for="chatId in chats" :key="chatId + '-m'" class="mb-2">
                                 <button @click="loadChatMessages(chatId); isMobileSidebarOpen=false;" :class="[selectedChatId===chatId ? 'bg-orange-100/60 text-orange-700 shadow' : 'bg-gray-100 text-gray-700 hover:bg-gray-200', 'w-full text-left px-3 py-2 rounded-lg transition flex items-center justify-between gap-2']">
                                     <span class="flex items-center gap-1 min-w-0">
@@ -85,7 +85,7 @@
 
             <!-- Main Chat Area -->
             <transition name="fade">
-                <div v-if="true" class="flex-1 flex flex-col glass-transparent-bg rounded-3xl md:rounded-r-3xl md:rounded-l-none">
+                <div v-if="true" class="flex-1 flex flex-col min-h-0 glass-transparent-bg rounded-3xl md:rounded-r-3xl md:rounded-l-none">
                     <!-- Chat Header -->
                     <div
                         class="h-14 flex items-center justify-between px-4 md:px-6 border-b border-white/20 bg-white/10 shadow-sm rounded-t-3xl md:rounded-tr-3xl md:rounded-tl-none">
@@ -111,7 +111,7 @@
                     </div>
 
                     <!-- Chat Messages Container -->
-                    <div ref="chatContainer" class="flex-1 overflow-y-auto px-3 md:px-6 py-3 md:py-4 pb-32 md:pb-4 space-y-3 md:space-y-4">
+                    <div ref="chatContainer" class="chat-scroll flex-1 min-h-0 overflow-y-auto px-3 md:px-6 py-3 md:py-4 pb-8 md:pb-4 space-y-3 md:space-y-4">
                         <transition-group name="list-fade" tag="div">
                             <div v-if="isLoadingHistory" class="flex items-center justify-center h-full text-gray-500">
                                 <div class="loader-dots">
@@ -231,7 +231,7 @@
                     </div>
 
                     <!-- Chat Input Bar -->
-                   <div class="flex flex-col px-3 md:px-6 py-3 md:py-4 bg-white/10 border-t border-white/20 shadow-lg rounded-br-3xl sticky bottom-0 left-0 right-0 z-10 md:static md:rounded-b-3xl">
+                   <div class="flex flex-col px-3 md:px-6 py-3 md:py-4 bg-white/10 border-t border-white/20 shadow-lg rounded-b-3xl">
                         <!-- File chip display -->
                         <div v-if="attachedFiles.length > 0" class="flex flex-wrap gap-2 mb-2" style="margin-bottom: 15px;">
                             <div v-for="(file, index) in attachedFiles" :key="index"
@@ -1224,6 +1224,25 @@ onMounted(async () => {
     display: none;
 }
 
+/* Mobile explicit scrollbar styling (used for chat list drawer) */
+.mobile-scrollbar {
+    scrollbar-width: thin; /* Firefox */
+    scrollbar-color: rgba(251,146,60,0.7) transparent;
+    -webkit-overflow-scrolling: touch; /* iOS momentum */
+    overscroll-behavior: contain;
+    touch-action: pan-y;
+}
+.mobile-scrollbar::-webkit-scrollbar { width: 8px; }
+.mobile-scrollbar::-webkit-scrollbar-track { background: transparent; }
+.mobile-scrollbar::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(251,146,60,0.85) 0%, rgba(251,146,60,0.55) 70%);
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.25);
+}
+.mobile-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, rgba(251,146,60,1) 0%, rgba(251,146,60,0.7) 70%);
+}
+
 /* Custom scrollbar for main chat area */
 .flex-1.overflow-y-auto.px-6.py-4.space-y-4 {
     scrollbar-width: thin;
@@ -1255,8 +1274,28 @@ body {
 }
 
 #BeginnerTeacher {
+    /* Contained layout: internal panes handle scrolling */
     overflow: hidden;
     border-radius: 32px;
+    min-height: 100vh;
+}
+
+/* Chat message area explicit scrolling (mobile & desktop) */
+.chat-scroll {
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(251,146,60,0.6) transparent;
+}
+.chat-scroll::-webkit-scrollbar { width: 8px; }
+.chat-scroll::-webkit-scrollbar-track { background: transparent; }
+.chat-scroll::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(251,146,60,0.85) 0%, rgba(251,146,60,0.55) 70%);
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.25);
+}
+.chat-scroll::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, rgba(251,146,60,1) 0%, rgba(251,146,60,0.7) 70%);
 }
 
 .material-symbols-outlined {
