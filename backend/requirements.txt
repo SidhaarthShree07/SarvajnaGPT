@@ -1,3 +1,5 @@
+## Canonical backend dependency list
+## Grouping: core, docs/media, OCR/PDF, automation, language/LLM, speech, telemetry
 fastapi
 uvicorn[standard]
 requests
@@ -23,3 +25,5 @@ pymupdf
 pdfplumber
 litellm
 posthog
+soundfile
+TTS
