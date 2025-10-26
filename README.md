@@ -191,4 +191,4 @@ Bottom line: Ollama is excellent for running models; SarvajñaGPT is an agentic 
 
 ## License
 
-MIT (see LICENSE if provided). If no license file exists, treat as All Rights Reserved until one is added.
+Released under the MIT License. © 2025 SIDHAARTH SHREE. See [LICENSE](./LICENSE) for full text.
