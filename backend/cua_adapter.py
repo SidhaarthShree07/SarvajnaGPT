@@ -918,28 +918,58 @@ def open_path(path: str) -> Dict[str, Any]:
 
 
 def open_vscode(path: Optional[str] = None, new_window: bool = False) -> Dict[str, Any]:
-    """Launch VS Code optionally opening a path. Minimal, best-effort.
+    """Launch VS Code optionally opening a path. Windows-friendly, best-effort.
 
-    Prefers 'code' on PATH; otherwise falls back to os.startfile on a file.
+    Launch order:
+    1) Use 'code' from PATH if available.
+    2) Try known VS Code executables (Code.exe) or code.cmd in typical install locations.
+    3) As a last resort on Windows, os.startfile(path) to open by association.
     """
     try:
-        import shutil as _sh, subprocess as _sp
-        cmd = _sh.which('code')
-        args = []
-        if cmd:
+        import shutil as _sh, subprocess as _sp, os as _os
+        def _run(prog: str, is_cmd: bool = False) -> Dict[str, Any]:
+            args = [prog]
+            if new_window:
+                args.append('--new-window')
             if path:
-                if new_window:
-                    args = [cmd, '--new-window', path]
-                else:
-                    args = [cmd, path]
-            else:
-                args = [cmd]
+                args.append(path)
             _sp.Popen(args, shell=False)
             return {'ok': True, 'launched': True, 'path': path, 'command': args}
-        # Fallback: open file via OS association (may still open in Code if default)
-        if path and os.path.exists(path) and os.name == 'nt':
-            os.startfile(path)  # type: ignore[attr-defined]
-            return {'ok': True, 'launched': True, 'path': path, 'command': None}
+
+        # 1) Prefer 'code' on PATH
+        cmd = _sh.which('code')
+        if cmd:
+            return _run(cmd)
+
+        # 2) Known install paths (Windows)
+        candidates = []
+        if _os.name == 'nt':
+            # User-local install
+            try:
+                user_prof = _os.environ.get('USERPROFILE') or _os.path.expanduser('~')
+            except Exception:
+                user_prof = None
+            if user_prof:
+                candidates.extend([
+                    _os.path.join(user_prof, r"AppData\Local\Programs\Microsoft VS Code\bin\code.cmd"),
+                    _os.path.join(user_prof, r"AppData\Local\Programs\Microsoft VS Code\Code.exe"),
+                ])
+            # System-wide installs
+            candidates.extend([
+                r"C:\\Program Files\\Microsoft VS Code\\bin\\code.cmd",
+                r"C:\\Program Files\\Microsoft VS Code\\Code.exe",
+                r"C:\\Program Files (x86)\\Microsoft VS Code\\bin\\code.cmd",
+                r"C:\\Program Files (x86)\\Microsoft VS Code\\Code.exe",
+            ])
+        for prog in candidates:
+            try_path = _os.path.expandvars(prog)
+            if _os.path.isfile(try_path):
+                return _run(try_path)
+
+        # 3) Fallback: open file via OS association (may still open in Code if default)
+        if path and _os.path.exists(path) and _os.name == 'nt':
+            _os.startfile(path)  # type: ignore[attr-defined]
+            return {'ok': True, 'launched': True, 'path': path, 'command': None, 'note': 'opened_by_association'}
         return {'ok': False, 'launched': False, 'path': path, 'error': 'code_not_found'}
     except Exception as e:  # pragma: no cover
         return {'ok': False, 'launched': False, 'path': path, 'error': str(e)}

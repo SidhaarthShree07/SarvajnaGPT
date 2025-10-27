@@ -2,7 +2,9 @@ import requests
 import os
 import json
 # Ollama default local server (override via OLLAMA_BASE env) e.g. http://localhost:11434
-OLLAMA_URL = "http://localhost:11434/api/generate"
+# If OLLAMA_BASE is provided, build URLs from it; else use localhost default
+_BASE = os.environ.get("OLLAMA_BASE", "http://localhost:11434").rstrip("/")
+OLLAMA_URL = f"{_BASE}/api/generate"
 # Persist selected model to disk so it survives restarts
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'ollama_settings.json')
 
@@ -43,6 +45,24 @@ def _query_ollama(prompt: str) -> str:
         data = response.json()
         return data.get("response", "").strip()
     except requests.Timeout:
+        try:
+            print("OLLAMA DEBUG: Timeout on generate (first path)")
+        except Exception:
+            pass
+        return ""
+    except requests.RequestException as e:
+        try:
+            print(f"OLLAMA DEBUG: RequestException on generate: {type(e).__name__}: {str(e).splitlines()[0]}")
+        except Exception:
+            pass
+        return ""
+    except Exception as e:
+        try:
+            print(f"OLLAMA DEBUG: Unexpected error on generate: {type(e).__name__}: {str(e).splitlines()[0]}")
+        except Exception:
+            pass
+        return ""
+    except Exception:
         return ""
 
 
@@ -63,6 +83,24 @@ def _query_ollama_with_options(prompt: str, *, temperature: float | None = None,
         data = response.json()
         return data.get("response", "").strip()
     except requests.Timeout:
+        try:
+            print("OLLAMA DEBUG: Timeout on generate_with_options")
+        except Exception:
+            pass
+        return ""
+    except requests.RequestException as e:
+        try:
+            print(f"OLLAMA DEBUG: RequestException on generate_with_options: {type(e).__name__}: {str(e).splitlines()[0]}")
+        except Exception:
+            pass
+        return ""
+    except Exception as e:
+        try:
+            print(f"OLLAMA DEBUG: Unexpected error on generate_with_options: {type(e).__name__}: {str(e).splitlines()[0]}")
+        except Exception:
+            pass
+        return ""
+    except Exception:
         return ""
 
 

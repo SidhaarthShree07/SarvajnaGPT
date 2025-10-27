@@ -71,6 +71,13 @@ def plan(req: CuaPlanRequest) -> dict:
         # fallback: use first line of text as objective
         objective = raw.splitlines()[0].strip() if raw else None
     if not objective:
-        raise HTTPException(status_code=400, detail="Planner failed to produce objective")
+        # Graceful fallback when LLM is unavailable/timeouts: use prompt as objective
+        fallback = (req.prompt or "").strip()
+        if fallback:
+            objective = fallback.splitlines()[0][:200]
+        else:
+            raise HTTPException(status_code=400, detail="Planner failed to produce objective")
+        preview = preview_objective(objective, target_rel)
+        return {"objective": objective, "target_rel": target_rel, "preview": preview, "degraded": True}
     preview = preview_objective(objective, target_rel)
     return {"objective": objective, "target_rel": target_rel, "preview": preview}

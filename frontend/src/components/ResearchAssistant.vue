@@ -249,6 +249,10 @@
                                                 <div v-if="msg.executeResult" class="mt-2 text-xs text-gray-600">Done:
                                                     {{ summarizeExecuteResult(msg.executeResult) }}</div>
                                             </div>
+                                            <div v-else-if="powerMode && msg.executeResult" class="mt-3 p-2 border border-emerald-200 rounded bg-emerald-50/80">
+                                                <div class="text-xs text-emerald-800 font-semibold mb-1">Automation</div>
+                                                <div class="text-xs text-gray-800">{{ summarizeExecuteResult(msg.executeResult) }}</div>
+                                            </div>
                                             <div v-if="msg.planPreviews && msg.planPreviews.length" class="mt-3 p-2 border border-orange-200 rounded bg-orange-100/60">
                                                 <div class="text-xs text-orange-800 font-semibold mb-1">Agent Actions</div>
                                                 <ul class="text-xs text-gray-800 list-disc ml-5 space-y-1">
@@ -1354,16 +1358,13 @@ async function refreshInlineSelection(quiet = false) {
     }
 }
 
+// Do not auto-activate inline selection when focusing the input placeholder.
+// Re-activation should only happen via the dedicated selection button.
 function handleInputFocus() {
-    refreshInlineSelection(true);
+    // Intentionally no-op for inline selection. Keep suggestions logic independent.
+    // If needed, we could also hide any inline selection messages here, but we avoid
+    // mutating selection state to preserve user intent until they click the button.
 }
-
-// Kept for compatibility but replaced by disableInlineSelection
-// function clearInlineSelectionIndicator() {
-//     inlineSelectionData.value = null;
-//     inlineSelectionError.value = '';
-//     inlineSelectionShouldReport.value = false;
-// }
 
 // Start automatic clipboard monitoring when Power Mode is enabled
 function startClipboardMonitoring() {
@@ -1816,7 +1817,9 @@ async function sendMessage() {
                     mem_tags: selectedTags.value && selectedTags.value.length > 0 ? selectedTags.value : undefined,
                     mem_context: mem_context,
                     // Ensure backend will auto-execute actions and include results in response
-                    auto_execute: true
+                    auto_execute: true,
+                    // Enable backend debug when user includes #debug tag
+                    debug: (selectedTags.value || []).map(t => String(t).toLowerCase()).includes('debug') ? true : undefined
                 })
             });
             if (!res.ok) throw new Error('Failed to get Power Mode response');

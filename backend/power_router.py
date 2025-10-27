@@ -36,6 +36,7 @@ try:
         arrange_three_columns,
         arrange_right_stack,
         layout_left_right_stack,
+            snap_to,
     )  # type: ignore
 except Exception:  # pragma: no cover
     try:
@@ -61,6 +62,7 @@ except Exception:  # pragma: no cover
             paste_rich_text_to_foreground_app,
             arrange_three_columns,
             layout_left_right_stack,
+            snap_to,
         )  # type: ignore
     except Exception:
         cua_runtime_status = None  # type: ignore
@@ -114,6 +116,31 @@ def _plain_from_markdown(md: str) -> str:
             l = l.replace("_", "")
         out_lines.append(l)
     return ("\n".join(out_lines)).strip()
+
+
+# Remove assistant meta-disclaimers and prefaces (e.g., "I cannot open Microsoft Word..." or "Here's a draft:")
+def _strip_meta_disclaimers(s: str) -> str:
+    try:
+        txt = s or ""
+        # Drop common meta sentences anywhere, but especially at the beginning
+        patterns = [
+            r"(?is)\b(i\s+(cannot|can't)\s+open\s+(microsoft\s+)?word\b[^\n\r]*)",
+            r"(?is)\b(i\s+(cannot|can't)\s+open\s+(applications|apps)\b[^\n\r]*)",
+            r"(?is)\b(as an ai[^\n\r]*)",
+            r"(?is)\b(i can help you write[^\n\r:]*)",
+            r"(?is)\b(here( is|'s) a draft\s*:?)",
+        ]
+        for pat in patterns:
+            txt = _re.sub(pat, "", txt)
+        # Remove leading filler like "Sure," or "Certainly," if they stand alone at start
+        txt = _re.sub(r"^(\s*(sure|certainly|of course|here you go|here's)\s*[:,\-\–\—]?\s*)", "", txt, flags=_re.IGNORECASE)
+        # Trim excessive leading blank lines
+        lines = txt.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        return "\n".join(lines).strip()
+    except Exception:
+        return s or ""
 
 
 def _docx_from_markdown(md: str, out_path: str) -> bool:
@@ -294,6 +321,8 @@ def _rtf_from_markdown(md: str) -> str:
 def _guess_code_language(text: str) -> str:
     lt = (text or '').lower()
     if '```html' in lt or '<html' in lt or 'doctype html' in lt or 'html>' in lt:
+        return 'html'
+    if ('website' in lt or 'landing page' in lt or 'web page' in lt) and ('section' in lt or 'css' in lt or 'hero' in lt or 'navbar' in lt):
         return 'html'
     if '```python' in lt or 'def ' in lt and 'import ' in lt:
         return 'python'
@@ -1079,6 +1108,7 @@ class PowerChatRequest(BaseModel):
     selected_tags: Optional[list[str]] = None
     mem_context: Optional[str] = None
     auto_execute: Optional[bool] = Field(False, description="If true, server may plan/execute actions and include results")
+    debug: Optional[bool] = Field(False, description="When true, include prompt/trace info in response and write JSONL log")
 
 
 # -------------------- Word inline enhance/replace endpoint --------------------
@@ -1341,13 +1371,27 @@ Now return ONLY the enhanced version of the selected text:"""
 
 # Lightweight LLM + hashtag router for power chat
 try:
-    from .llm_inference import generate_response as _power_llm
+    from .llm_inference import (
+        generate_response as _power_llm,
+        generate_response_with_options as _power_llm_opts,
+        get_model_name as _power_llm_model,
+        get_settings as _power_llm_settings,
+    )
 except Exception:  # pragma: no cover
     try:
         from llm_inference import generate_response as _power_llm  # type: ignore
+        from llm_inference import generate_response_with_options as _power_llm_opts  # type: ignore
+        from llm_inference import get_model_name as _power_llm_model  # type: ignore
+        from llm_inference import get_settings as _power_llm_settings  # type: ignore
     except Exception:  # pragma: no cover
         def _power_llm(prompt: str) -> str:  # type: ignore
             return ""
+        def _power_llm_opts(prompt: str, **kwargs) -> str:  # type: ignore
+            return ""
+        def _power_llm_model() -> str:  # type: ignore
+            return "unknown"
+        def _power_llm_settings() -> Dict[str, Any]:  # type: ignore
+            return {"temperature": 0.7, "max_tokens": 2048}
 
 try:
     # Import agent autoplan to support #plan hashtag
@@ -1359,6 +1403,39 @@ except Exception:  # pragma: no cover
 
 @router.post("/power_chat")
 def power_chat(req: PowerChatRequest) -> Dict[str, Any]:
+    # Debug helpers (request flag or env POWER_DEBUG)
+    import os as _os_dbg, datetime as _dt_dbg, json as _json_dbg
+    def _dbg_enabled() -> bool:
+        try:
+            if bool(getattr(req, 'debug', False)):
+                return True
+            val = (_os_dbg.environ.get('POWER_DEBUG') or '').strip().lower()
+            return val in {'1','true','yes','on'}
+        except Exception:
+            return False
+
+    def _dbg_write(entry: Dict[str, Any]) -> None:
+        try:
+            if not _dbg_enabled():
+                return
+            base = Path(__file__).resolve().parent.parent / 'agent_output' / 'debug'
+            base.mkdir(parents=True, exist_ok=True)
+            fp = base / 'power_mode.jsonl'
+            ts = _dt_dbg.datetime.utcnow().isoformat() + 'Z'
+            safe = dict(entry)
+            safe['ts'] = ts
+            with open(fp, 'a', encoding='utf-8') as f:
+                f.write(_json_dbg.dumps(safe, ensure_ascii=False) + '\n')
+            # Also mirror to console for immediate visibility
+            try:
+                preview = _json_dbg.dumps({k: (v[:140] + '…' if isinstance(v, str) and len(v) > 140 else v) for k, v in safe.items()}, ensure_ascii=False)
+                print(f"POWER_DEBUG: {preview}")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    _dbg_write({'phase': 'start', 'chat_id': getattr(req, 'chat_id', None), 'service': getattr(req, 'service', None)})
     # Determine conversational content
     last = (req.text or '').strip()
     roles = []
@@ -1385,6 +1462,9 @@ def power_chat(req: PowerChatRequest) -> Dict[str, Any]:
         if k and k not in seen:
             seen.add(k)
             normalized_tags.append(k)
+
+    if _dbg_enabled():
+        _dbg_write({'phase': 'tags', 'normalized_tags': normalized_tags, 'last_len': len(last or '')})
 
     # Helper: resolve memory context and quick item previews for given tag list
     def _mem_from_tags(tag_list: list[str]) -> tuple[Optional[str], list[Dict[str, Any]]]:
@@ -1463,6 +1543,7 @@ def power_chat(req: PowerChatRequest) -> Dict[str, Any]:
             pass
 
     # Default: simple LLM echo of the conversation
+    prompt = ""
     try:
         # Build a lightweight chat-style prompt
         history = []
@@ -1473,7 +1554,14 @@ def power_chat(req: PowerChatRequest) -> Dict[str, Any]:
         mem_ctx = provided_mem_ctx
         if not mem_ctx and normalized_tags:
             mem_ctx, mem_items = _mem_from_tags(normalized_tags)
-        base = "You are Sarvajña Power Mode. Be concise and helpful.\n"
+        base = (
+            "You are Sarvajña Power Mode. Be concise and helpful.\n"
+            "Rules:\n"
+            "- Never talk about your system limitations (e.g., do not say you cannot open apps).\n"
+            "- When asked to write or create content (e.g., for a Word document), output only the content.\n"
+            "- Do not include prefaces like 'Here's a draft:' or 'I can help you'.\n"
+            "- Do not include <think> sections or hidden notes.\n"
+        )
         if mem_ctx:
             base += "Memory context from #tags:\n" + mem_ctx + "\n\n"
         # If the intent is code, enforce code-only output with a single fenced block
@@ -1501,7 +1589,77 @@ def power_chat(req: PowerChatRequest) -> Dict[str, Any]:
         # Include current user instruction explicitly if messages[] were not provided
         user_line = f"user: {last}" if (last and not req.messages) else ""
         prompt = base + "\n".join(history + ([user_line] if user_line else [])) + "\nassistant:"
+        html_req = ('html' in (last or '').lower())
+        if _dbg_enabled():
+            _dbg_write({'phase': 'prompt', 'has_mem_ctx': bool(mem_ctx), 'mem_ctx_len': len(mem_ctx or ''), 'history_len': len(history), 'prompt_preview': (prompt[:1200] if prompt else ''), 'intent_code_prompt': bool(intent_code_prompt)})
+        elif html_req:
+            # Minimal console log even when debug flag is off
+            try:
+                print(f"POWER_HTML: prompt built (len={len(prompt or '')}) intent_code_prompt={bool(intent_code_prompt)}")
+            except Exception:
+                pass
+        # Attempt 1
+        try:
+            model_name = _power_llm_model() if callable(_power_llm_model) else None
+            llm_opts = _power_llm_settings() if callable(_power_llm_settings) else None
+        except Exception:
+            model_name = None; llm_opts = None
+        if _dbg_enabled():
+            _dbg_write({'phase': 'llm_call', 'attempt': 1, 'model': model_name, 'opts': llm_opts})
+        elif html_req:
+            try:
+                print(f"POWER_HTML: LLM attempt 1 model={model_name} opts={llm_opts}")
+            except Exception:
+                pass
         text = _power_llm(prompt)
+        if _dbg_enabled():
+            _dbg_write({'phase': 'llm_return', 'attempt': 1, 'text_len': len(text or ''), 'text_preview': (text or '')[:1200]})
+        elif html_req:
+            try:
+                print(f"POWER_HTML: LLM return attempt 1 text_len={len(text or '')}")
+            except Exception:
+                pass
+        # HTML-specific retry strategy when the first call returns empty
+        if (not text) and intent_code_prompt and ('html' in (last or '').lower()):
+            minimal = (
+                "Return ONLY one fenced code block with a complete, valid HTML5 document for the user's request.\n"
+                "No explanations. Use semantic structure, responsive CSS, and a nice hero section.\n"
+            )
+            import re as _re2
+            alt_user = _re2.sub(r"#[A-Za-z0-9_\-]+", "", last or '').strip()
+            alt_prompt = minimal + ("\nTask: " + alt_user if alt_user else '') + "\nassistant:"
+            if _dbg_enabled():
+                _dbg_write({'phase': 'llm_retry_prep', 'reason': 'empty_html_first', 'alt_prompt_preview': alt_prompt[:800]})
+            elif html_req:
+                try:
+                    print("POWER_HTML: empty on attempt 1; retrying with minimal prompt and temperature=0.3 → 0.0 if needed")
+                except Exception:
+                    pass
+            # Retry 2: lower temperature, higher tokens
+            try:
+                text = _power_llm_opts(alt_prompt, temperature=0.3, max_tokens=3072) if callable(_power_llm_opts) else (text or '')
+            except Exception:
+                text = text or ''
+            if _dbg_enabled():
+                _dbg_write({'phase': 'llm_return', 'attempt': 2, 'text_len': len(text or ''), 'text_preview': (text or '')[:1200]})
+            elif html_req:
+                try:
+                    print(f"POWER_HTML: LLM return attempt 2 text_len={len(text or '')}")
+                except Exception:
+                    pass
+            # Retry 3: deterministic
+            if not text:
+                try:
+                    text = _power_llm_opts(alt_prompt, temperature=0.0, max_tokens=3072) if callable(_power_llm_opts) else (text or '')
+                except Exception:
+                    text = text or ''
+                if _dbg_enabled():
+                    _dbg_write({'phase': 'llm_return', 'attempt': 3, 'text_len': len(text or ''), 'text_preview': (text or '')[:1200]})
+                elif html_req:
+                    try:
+                        print(f"POWER_HTML: LLM return attempt 3 text_len={len(text or '')}")
+                    except Exception:
+                        pass
     except Exception:
         text = ""
     # Helper: default save directory under Documents/Sarvjan
@@ -1527,100 +1685,19 @@ def power_chat(req: PowerChatRequest) -> Dict[str, Any]:
     try:
         want_exec = bool(getattr(req, 'auto_execute', False))
         low = (last or '').lower()
-        intent_word_write = ("word" in low or "document" in low) and ("write" in low or "type" in low or "insert" in low or "fill" in low or "paste" in low or "create" in low or "save" in low or "summary" in low)
-        intent_code = ("code" in low or "vscode" in low or "visual studio code" in low) and ("write" in low or "create" in low or "make" in low or "generate" in low)
+        # Broaden verb detection to catch past tense and synonyms users naturally type
+        verb_write_like = ("write" in low or "wrote" in low or "type" in low or "insert" in low or "fill" in low or "paste" in low or "create" in low or "save" in low or "summary" in low or "draft" in low or "produce" in low or "output" in low or "build" in low or "make" in low or "generate" in low)
+        intent_word_write = ("word" in low or "document" in low) and verb_write_like
+        intent_code = ("code" in low or "vscode" in low or "visual studio code" in low) and verb_write_like
+        if _dbg_enabled():
+            _dbg_write({'phase': 'intent', 'auto_execute': want_exec, 'intent_word_write': bool(intent_word_write), 'intent_code': bool(intent_code)})
 
-        if want_exec and intent_code and text:
-            # Create a new file under Documents/Sarvjan and open in VS Code (new window)
-            save_dir = _default_save_dir()
-            # Basic extension heuristics
-            ext = '.txt'
-            lang_hint = None
-            if any(k in low for k in ['python', 'py code']):
-                ext = '.py'
-                lang_hint = 'python'
-            elif any(k in low for k in ['javascript', 'js code', 'node']):
-                ext = '.js'
-                lang_hint = 'javascript'
-            elif 'typescript' in low or 'ts code' in low:
-                ext = '.ts'
-                lang_hint = 'typescript'
-            elif 'html' in low:
-                ext = '.html'
-                lang_hint = 'html'
-            elif 'css' in low:
-                ext = '.css'
-                lang_hint = 'css'
-            if not lang_hint:
-                lang_hint = _guess_code_language(text)
-            ts = _dt.datetime.now().strftime('%Y%m%d-%H%M%S')
-            fname = f"code-{ts}{ext}"
-            target = save_dir / fname
-            # Write assistant text to file
-            try:
-                code_only = _extract_code_from_llm(text or '', lang_hint)
-                target.write_text(code_only or '', encoding='utf-8')
-            except Exception as e:
-                # Ensure directory exists, then retry once
-                try:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    code_only = _extract_code_from_llm(text or '', lang_hint)
-                    target.write_text(code_only or '', encoding='utf-8')
-                except Exception:
-                    pass
-            opened = None
-            try:
-                # Always open in a NEW VS Code window for deterministic snapping
-                opened = cua_open_vscode(str(target), True) if callable(cua_open_vscode) else {"ok": False}
-            except Exception:
-                opened = {"ok": False, "error": "vscode_launch_failed"}
-            # If HTML, open a browser preview of the file (prefer Chrome) in its own window (avoid duplicate tabs)
-            browser = None
-            tri_snap = None
-            if ext == '.html' and callable(cua_open_browser_to_path):
-                try:
-                    browser = cua_open_browser_to_path(str(target), new_window=True)
-                    # Order-agnostic right-stack flow per user request
-                    try:
-                        from .cua_adapter import layout_any_right_stack  # type: ignore
-                    except Exception:
-                        try:
-                            from cua_adapter import layout_any_right_stack  # type: ignore
-                        except Exception:
-                            layout_any_right_stack = None  # type: ignore
-                    try:
-                        stem = target.stem
-                        stem_space = stem.replace("-", " ")
-                        page_title = _html_title_from_file(target)
-                        if callable(wait_for_window_appearance):
-                            wait_tokens = [target.name, stem, stem_space, "microsoft edge", "edge", "google chrome", "chrome", "mozilla firefox", "firefox", "brave"]
-                            if page_title:
-                                wait_tokens = [page_title] + wait_tokens
-                            _ = wait_for_window_appearance(wait_tokens, timeout_ms=7000)
-                        code_title1 = f"{target.name} - Visual Studio Code"; code_title2 = f"{stem} - Visual Studio Code"
-                        edge_title1 = f"{target.name} - Microsoft Edge"; edge_title2 = f"{stem} - Microsoft Edge"
-                        app_tokens_arr = ["sarvajña", "sarvajna", "sarvajnagpt", "sarvajna gpt"]
-                        browser_tokens_arr = [edge_title1, edge_title2, target.name, stem, stem_space, "microsoft edge", "edge", "google chrome", "chrome"]
-                        if page_title:
-                            browser_tokens_arr = [f"{page_title} - Microsoft Edge", page_title] + browser_tokens_arr
-                        code_tokens_arr = [code_title1, code_title2, "visual studio code", "vs code", "vscode", "code"]
-                        if callable(layout_any_right_stack):  # type: ignore[truthy-bool]
-                            tri_snap = {"attempted": True, "generic_stack": layout_any_right_stack(app_tokens_arr, browser_tokens_arr, code_tokens_arr)}  # type: ignore[misc]
-                        else:
-                            tri_snap = {"attempted": True, "generic_stack": {"ok": False, "reason": "generic_stack_unavailable"}}
-                    except Exception:
-                        tri_snap = {"attempted": True, "generic_stack": {"ok": False, "reason": "generic_stack_failed"}}
-                except Exception:
-                    browser = {"ok": False, "error": "browser_launch_failed"}
-            execute_block = {
-                "intent": "code_write",
-                "path": str(target),
-                "opened": opened,
-                **({"browser": browser} if browser else {}),
-                **({"tri_snap": tri_snap} if tri_snap else {}),
-            }
-
-        if want_exec and intent_word_write and text and execute_block is None:
+        # Prefer Word/document writing when both intents are detected (e.g., "open Word and write 2 paragraphs about python")
+        # Previously, mere presence of language keywords like 'python' would trigger the code path, skipping Word automation.
+        # We fix this by prioritizing intent_word_write over intent_code to match user intent for prose/documents.
+        if want_exec and intent_word_write and text:
+            # Sanitize meta-disclaimers before producing Word content
+            text = _strip_meta_disclaimers(text)
             # Find a target .doc or .docx file from memory items or doc_info
             from pathlib import Path as _P
             repo_root = _P(__file__).resolve().parent.parent
@@ -1742,6 +1819,323 @@ def power_chat(req: PowerChatRequest) -> Dict[str, Any]:
                         "snap": None,
                         "paste": paste_info,
                     }
+
+        elif want_exec and intent_code and text:
+            # Create a new file under Documents/Sarvjan and open in VS Code (new window)
+            save_dir = _default_save_dir()
+            # Basic extension heuristics
+            ext = '.txt'
+            lang_hint = None
+            if any(k in low for k in ['python', 'py code']):
+                ext = '.py'
+                lang_hint = 'python'
+            elif any(k in low for k in ['javascript', 'js code', 'node']):
+                ext = '.js'
+                lang_hint = 'javascript'
+            elif 'typescript' in low or 'ts code' in low:
+                ext = '.ts'
+                lang_hint = 'typescript'
+            elif 'html' in low:
+                ext = '.html'
+                lang_hint = 'html'
+            elif 'css' in low:
+                ext = '.css'
+                lang_hint = 'css'
+            if not lang_hint:
+                lang_hint = _guess_code_language(text)
+            ts = _dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+            fname = f"code-{ts}{ext}"
+            target = save_dir / fname
+            # Write assistant text to file
+            try:
+                code_only = _extract_code_from_llm(text or '', lang_hint)
+                target.write_text(code_only or '', encoding='utf-8')
+            except Exception as e:
+                # Ensure directory exists, then retry once
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    code_only = _extract_code_from_llm(text or '', lang_hint)
+                    target.write_text(code_only or '', encoding='utf-8')
+                except Exception:
+                    pass
+            if _dbg_enabled():
+                _dbg_write({'phase': 'code_write', 'path': str(target), 'lang_hint': lang_hint, 'code_len': len((code_only or ''))})
+            opened = None
+            try:
+                # Always open in a NEW VS Code window for deterministic snapping
+                opened = cua_open_vscode(str(target), True) if callable(cua_open_vscode) else {"ok": False}
+            except Exception:
+                opened = {"ok": False, "error": "vscode_launch_failed"}
+            # If HTML, open a browser preview of the file (prefer Chrome) in its own window (avoid duplicate tabs)
+            browser = None
+            tri_snap = None
+            if ext == '.html' and callable(cua_open_browser_to_path):
+                try:
+                    browser = cua_open_browser_to_path(str(target), new_window=True)
+                    # Order-agnostic right-stack flow per user request
+                    try:
+                        from .cua_adapter import layout_any_right_stack  # type: ignore
+                    except Exception:
+                        try:
+                            from cua_adapter import layout_any_right_stack  # type: ignore
+                        except Exception:
+                            layout_any_right_stack = None  # type: ignore
+                    try:
+                        stem = target.stem
+                        stem_space = stem.replace("-", " ")
+                        page_title = _html_title_from_file(target)
+                        if callable(wait_for_window_appearance):
+                            wait_tokens = [target.name, stem, stem_space, "microsoft edge", "edge", "google chrome", "chrome", "mozilla firefox", "firefox", "brave"]
+                            if page_title:
+                                wait_tokens = [page_title] + wait_tokens
+                            _ = wait_for_window_appearance(wait_tokens, timeout_ms=7000)
+                            # Also wait for VS Code to appear so we can snap reliably
+                            try:
+                                code_wait_tokens = [f"{target.name} - Visual Studio Code", f"{stem} - Visual Studio Code", target.name, stem, "visual studio code", "code"]
+                                _ = wait_for_window_appearance(code_wait_tokens, timeout_ms=6000)
+                            except Exception:
+                                pass
+                        code_title1 = f"{target.name} - Visual Studio Code"; code_title2 = f"{stem} - Visual Studio Code"
+                        edge_title1 = f"{target.name} - Microsoft Edge"; edge_title2 = f"{stem} - Microsoft Edge"
+                        app_tokens_arr = ["sarvajña", "sarvajna", "sarvajnagpt", "sarvajna gpt"]
+                        browser_tokens_arr = [edge_title1, edge_title2, target.name, stem, stem_space, "microsoft edge", "edge", "google chrome", "chrome"]
+                        if page_title:
+                            browser_tokens_arr = [f"{page_title} - Microsoft Edge", page_title] + browser_tokens_arr
+                        code_tokens_arr = [code_title1, code_title2, "visual studio code", "vs code", "vscode", "code"]
+                        if callable(layout_any_right_stack):  # type: ignore[truthy-bool]
+                            tri_first = layout_any_right_stack(app_tokens_arr, browser_tokens_arr, code_tokens_arr)  # type: ignore[misc]
+                            tri_snap = {"attempted": True, "generic_stack": tri_first}
+                            try:
+                                print(f"POWER_HTML: layout_any_right_stack.ok={bool(tri_first.get('ok')) if isinstance(tri_first, dict) else None}")
+                            except Exception:
+                                pass
+                            if not (isinstance(tri_first, dict) and tri_first.get('ok')):
+                                # Fallback 1: keyboard-driven layout
+                                try:
+                                    tri_alt = layout_left_right_stack(app_tokens_arr, browser_tokens_arr, code_tokens_arr)  # type: ignore[misc]
+                                except Exception:
+                                    tri_alt = {"ok": False, "reason": "layout_left_right_failed"}
+                                tri_snap['fallback_left_right'] = tri_alt
+                                try:
+                                    print(f"POWER_HTML: layout_left_right_stack.ok={bool(tri_alt.get('ok'))}")
+                                except Exception:
+                                    pass
+                                if not tri_alt.get('ok'):
+                                    # Fallback 2: absolute SetWindowPos placement
+                                    try:
+                                        tri_arr = arrange_right_stack(app_tokens_arr, browser_tokens_arr, code_tokens_arr)  # type: ignore[misc]
+                                    except Exception:
+                                        tri_arr = {"ok": False, "reason": "arrange_right_stack_failed"}
+                                    tri_snap['fallback_arrange'] = tri_arr
+                                    try:
+                                        print(f"POWER_HTML: arrange_right_stack.ok={bool(tri_arr.get('ok'))}")
+                                    except Exception:
+                                        pass
+                        else:
+                            tri_snap = {"attempted": True, "generic_stack": {"ok": False, "reason": "generic_stack_unavailable"}}
+                    except Exception:
+                        tri_snap = {"attempted": True, "generic_stack": {"ok": False, "reason": "generic_stack_failed"}}
+                except Exception:
+                    browser = {"ok": False, "error": "browser_launch_failed"}
+            # For non-HTML code, attempt a simple two-pane split: App (left) | Code (right)
+            if ext != '.html':
+                try:
+                    app_tokens_arr = ["sarvajña", "sarvajna", "sarvajnagpt", "sarvajna gpt"]
+                    code_title1 = f"{target.name} - Visual Studio Code"; code_title2 = f"{target.stem} - Visual Studio Code"
+                    code_tokens_arr = [code_title1, code_title2, "visual studio code", "vs code", "vscode", "code"]
+                    steps = []
+                    # Focus app and snap left
+                    try:
+                        ok_app = (ensure_focus_top(app_tokens_arr) or ensure_focus(app_tokens_arr)) if callable(ensure_focus_top) else False
+                    except Exception:
+                        ok_app = False
+                    if callable(snap_to):
+                        left_ok = snap_to('left') if ok_app else False
+                    else:
+                        left_ok = False
+                    steps.append({'action': 'app_left', 'focus_ok': bool(ok_app), 'snap_left_ok': bool(left_ok)})
+                    # Focus code and snap right
+                    try:
+                        ok_code = (ensure_focus_top(code_tokens_arr) or ensure_focus(code_tokens_arr)) if callable(ensure_focus_top) else False
+                    except Exception:
+                        ok_code = False
+                    if callable(snap_to):
+                        right_ok = snap_to('right') if ok_code else False
+                    else:
+                        right_ok = False
+                    steps.append({'action': 'code_right', 'focus_ok': bool(ok_code), 'snap_right_ok': bool(right_ok)})
+                    tri_snap = {'attempted': True, 'two_pane': True, 'steps': steps}
+                except Exception:
+                    tri_snap = {'attempted': True, 'two_pane': False}
+            execute_block = {
+                "intent": "code_write",
+                "path": str(target),
+                "opened": opened,
+                **({"browser": browser} if browser else {}),
+                **({"tri_snap": tri_snap} if tri_snap else {}),
+            }
+            if _dbg_enabled():
+                _dbg_write({'phase': 'execute_code', 'opened': opened, 'browser': browser, 'tri_snap': tri_snap})
+
+        # Fallback: intent_code detected but LLM returned empty text — still create a useful starter file and open it
+        elif want_exec and intent_code and not text:
+            if _dbg_enabled():
+                _dbg_write({'phase': 'intent_fallback', 'reason': 'llm_empty_for_code'})
+            save_dir = _default_save_dir()
+            ext = '.txt'
+            # Choose a reasonable default language based on the user's request text
+            if 'python' in low or 'py ' in low or low.endswith(' py'):
+                ext = '.py'
+            elif 'html' in low:
+                ext = '.html'
+            elif 'javascript' in low or ' js' in low:
+                ext = '.js'
+            elif 'typescript' in low or ' ts' in low:
+                ext = '.ts'
+            elif 'css' in low:
+                ext = '.css'
+            ts = _dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+            target = save_dir / f"code-{ts}{ext}"
+
+            # Minimal starter content by type
+            starter = ''
+            if ext == '.html':
+                starter = (
+                    "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\"/>\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\n  <title>New Page</title>\n  <style>body{font:16px/1.5 system-ui, sans-serif; margin:0; padding:2rem;} .container{max-width:960px;margin:0 auto;} h1{margin:0 0 1rem;} .muted{color:#666}</style>\n</head>\n<body>\n  <div class=\"container\">\n    <h1>Starter Page</h1>\n    <p class=\"muted\">This file was created automatically because the LLM returned no code. You can edit it in VS Code.</p>\n  </div>\n</body>\n</html>\n"
+                )
+            elif ext == '.py':
+                starter = (
+                    "def is_even(n: int) -> bool:\n    return n % 2 == 0\n\nif __name__ == '__main__':\n    nums = list(range(10))\n    evens = [n for n in nums if is_even(n)]\n    print('Even numbers:', evens)\n"
+                )
+            elif ext == '.js':
+                starter = (
+                    "const isEven = n => n % 2 === 0;\nconst nums = [...Array(10).keys()];\nconsole.log('Even numbers:', nums.filter(isEven));\n"
+                )
+            elif ext == '.ts':
+                starter = (
+                    "const isEven = (n: number): boolean => n % 2 === 0;\nconst nums: number[] = Array.from({length: 10}, (_, i) => i);\nconsole.log('Even numbers:', nums.filter(isEven));\n"
+                )
+            elif ext == '.css':
+                starter = (
+                    "/* Starter stylesheet created automatically */\n:root { --fg: #111; --bg: #fff; }\nbody { color: var(--fg); background: var(--bg); font: 16px/1.5 system-ui, sans-serif; }\n"
+                )
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(starter, encoding='utf-8')
+            except Exception:
+                pass
+            opened = None
+            try:
+                opened = cua_open_vscode(str(target), True) if callable(cua_open_vscode) else {"ok": False}
+            except Exception:
+                opened = {"ok": False, "error": "vscode_launch_failed"}
+            browser = None
+            tri_snap = None
+            if target.suffix.lower() == '.html' and callable(cua_open_browser_to_path):
+                try:
+                    browser = cua_open_browser_to_path(str(target), new_window=True)
+                    # Attempt tri-split with the same robust fallbacks as the non-fallback path
+                    try:
+                        from .cua_adapter import layout_any_right_stack  # type: ignore
+                    except Exception:
+                        try:
+                            from cua_adapter import layout_any_right_stack  # type: ignore
+                        except Exception:
+                            layout_any_right_stack = None  # type: ignore
+                    try:
+                        stem = target.stem
+                        stem_space = stem.replace("-", " ")
+                        page_title = _html_title_from_file(target)
+                        if callable(wait_for_window_appearance):
+                            wait_tokens = [target.name, stem, stem_space, "microsoft edge", "edge", "google chrome", "chrome", "mozilla firefox", "firefox", "brave"]
+                            if page_title:
+                                wait_tokens = [page_title] + wait_tokens
+                            _ = wait_for_window_appearance(wait_tokens, timeout_ms=7000)
+                            try:
+                                code_wait_tokens = [f"{target.name} - Visual Studio Code", f"{stem} - Visual Studio Code", target.name, stem, "visual studio code", "code"]
+                                _ = wait_for_window_appearance(code_wait_tokens, timeout_ms=6000)
+                            except Exception:
+                                pass
+                        code_title1 = f"{target.name} - Visual Studio Code"; code_title2 = f"{stem} - Visual Studio Code"
+                        edge_title1 = f"{target.name} - Microsoft Edge"; edge_title2 = f"{stem} - Microsoft Edge"
+                        app_tokens_arr = ["sarvajña", "sarvajna", "sarvajnagpt", "sarvajna gpt"]
+                        browser_tokens_arr = [edge_title1, edge_title2, target.name, stem, stem_space, "microsoft edge", "edge", "google chrome", "chrome"]
+                        if page_title:
+                            browser_tokens_arr = [f"{page_title} - Microsoft Edge", page_title] + browser_tokens_arr
+                        code_tokens_arr = [code_title1, code_title2, "visual studio code", "vs code", "vscode", "code"]
+                        if callable(layout_any_right_stack):  # type: ignore[truthy-bool]
+                            tri_first = layout_any_right_stack(app_tokens_arr, browser_tokens_arr, code_tokens_arr)  # type: ignore[misc]
+                            tri_snap = {"attempted": True, "generic_stack": tri_first}
+                            try:
+                                print(f"POWER_HTML: layout_any_right_stack.ok={bool(tri_first.get('ok')) if isinstance(tri_first, dict) else None}")
+                            except Exception:
+                                pass
+                            if not (isinstance(tri_first, dict) and tri_first.get('ok')):
+                                try:
+                                    tri_alt = layout_left_right_stack(app_tokens_arr, browser_tokens_arr, code_tokens_arr)  # type: ignore[misc]
+                                except Exception:
+                                    tri_alt = {"ok": False, "reason": "layout_left_right_failed"}
+                                tri_snap['fallback_left_right'] = tri_alt
+                                try:
+                                    print(f"POWER_HTML: layout_left_right_stack.ok={bool(tri_alt.get('ok'))}")
+                                except Exception:
+                                    pass
+                                if not tri_alt.get('ok'):
+                                    try:
+                                        tri_arr = arrange_right_stack(app_tokens_arr, browser_tokens_arr, code_tokens_arr)  # type: ignore[misc]
+                                    except Exception:
+                                        tri_arr = {"ok": False, "reason": "arrange_right_stack_failed"}
+                                    tri_snap['fallback_arrange'] = tri_arr
+                                    try:
+                                        print(f"POWER_HTML: arrange_right_stack.ok={bool(tri_arr.get('ok'))}")
+                                    except Exception:
+                                        pass
+                        else:
+                            tri_snap = {"attempted": True, "generic_stack": {"ok": False, "reason": "generic_stack_unavailable"}}
+                    except Exception:
+                        tri_snap = {"attempted": True, "generic_stack": {"ok": False, "reason": "generic_stack_failed"}}
+                except Exception:
+                    browser = {"ok": False, "error": "browser_launch_failed"}
+            # For non-HTML code fallback path, attempt two-pane split as well
+            if target.suffix.lower() != '.html':
+                try:
+                    app_tokens_arr = ["sarvajña", "sarvajna", "sarvajnagpt", "sarvajna gpt"]
+                    code_title1 = f"{target.name} - Visual Studio Code"; code_title2 = f"{target.stem} - Visual Studio Code"
+                    code_tokens_arr = [code_title1, code_title2, "visual studio code", "vs code", "vscode", "code"]
+                    steps = []
+                    try:
+                        ok_app = (ensure_focus_top(app_tokens_arr) or ensure_focus(app_tokens_arr)) if callable(ensure_focus_top) else False
+                    except Exception:
+                        ok_app = False
+                    if callable(snap_to):
+                        left_ok = snap_to('left') if ok_app else False
+                    else:
+                        left_ok = False
+                    steps.append({'action': 'app_left', 'focus_ok': bool(ok_app), 'snap_left_ok': bool(left_ok)})
+                    try:
+                        ok_code = (ensure_focus_top(code_tokens_arr) or ensure_focus(code_tokens_arr)) if callable(ensure_focus_top) else False
+                    except Exception:
+                        ok_code = False
+                    if callable(snap_to):
+                        right_ok = snap_to('right') if ok_code else False
+                    else:
+                        right_ok = False
+                    steps.append({'action': 'code_right', 'focus_ok': bool(ok_code), 'snap_right_ok': bool(right_ok)})
+                    tri_snap = {'attempted': True, 'two_pane': True, 'steps': steps}
+                except Exception:
+                    tri_snap = {'attempted': True, 'two_pane': False}
+            execute_block = {
+                "intent": "code_write",
+                "path": str(target),
+                "opened": opened,
+                **({"browser": browser} if browser else {}),
+                **({"tri_snap": tri_snap} if tri_snap else {}),
+                "fallback": True,
+            }
+            if _dbg_enabled():
+                _dbg_write({'phase': 'execute_code', 'opened': opened, 'browser': browser, 'tri_snap': tri_snap, 'fallback': True})
+
+        # If neither branch ran and we still want to execute, leave execute_block as None (no-op)
     except Exception:
         execute_block = None
 
@@ -1784,6 +2178,8 @@ def power_chat(req: PowerChatRequest) -> Dict[str, Any]:
     }
     if execute_block is not None:
         resp["execute"] = execute_block
+        # Also return under execute_result for frontend compatibility
+        resp["execute_result"] = execute_block
         # Persist doc_path into chat_state if available
         try:
             doc_path = None
